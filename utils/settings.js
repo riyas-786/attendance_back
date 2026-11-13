@@ -20,6 +20,8 @@ const ENV = {
   lateCountThreshold: 'LATE_COUNT_THRESHOLD',
   lateDeductionDays: 'LATE_DEDUCTION_DAYS',
   salaryCurrency: 'SALARY_CURRENCY',
+  payrollStartDay: 'PAYROLL_START_DAY',
+  payHoursPerDay: 'PAY_HOURS_PER_DAY',
 };
 
 const num = (v, fallback) => {
@@ -49,6 +51,8 @@ function envDefaults() {
     lateCountThreshold: num(e.LATE_COUNT_THRESHOLD, 3),
     lateDeductionDays: num(e.LATE_DEDUCTION_DAYS, 0.5),
     salaryCurrency: e.SALARY_CURRENCY || 'AED',
+    payrollStartDay: num(e.PAYROLL_START_DAY, 1),
+    payHoursPerDay: num(e.PAY_HOURS_PER_DAY, 8),
   };
 }
 
@@ -138,6 +142,16 @@ function validate(input = {}, base = envDefaults()) {
     const c = String(input.salaryCurrency).trim();
     if (!c || c.length > 8) return { error: 'Currency must be 1 to 8 characters' };
     v.salaryCurrency = c;
+  }
+  if (has('payrollStartDay')) {
+    const n = Number(input.payrollStartDay);
+    if (!Number.isInteger(n) || n < 1 || n > 28) return { error: 'Pay period start day must be a whole number from 1 to 28' };
+    v.payrollStartDay = n;
+  }
+  if (has('payHoursPerDay')) {
+    const n = Number(input.payHoursPerDay);
+    if (!isNum(n) || n <= 0 || n > 24) return { error: 'Hours in a paid day must be more than 0 and at most 24' };
+    v.payHoursPerDay = n;
   }
   return { values: v };
 }

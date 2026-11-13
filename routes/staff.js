@@ -13,9 +13,13 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // Normalises the optional salary fields; returns { error } for bad input
 function salaryFields(body) {
   const out = {};
+  if (body.payType !== undefined) {
+    if (!['monthly', 'daily', 'hourly'].includes(body.payType)) return { error: 'Pay type must be monthly, daily or hourly' };
+    out.payType = body.payType;
+  }
   if (body.baseSalary !== undefined && body.baseSalary !== '') {
     const n = Number(body.baseSalary);
-    if (!Number.isFinite(n) || n < 0) return { error: 'Salary must be a number of 0 or more' };
+    if (!Number.isFinite(n) || n < 0) return { error: 'Salary or rate must be a number of 0 or more' };
     out.baseSalary = n;
   }
   if (body.joinDate !== undefined) {
@@ -49,8 +53,9 @@ async function assignmentFields(body) {
 }
 
 router.get('/', async (req, res) => {
-  const users = await User.find().sort({ name: 1 });
-  res.json(users);
+  const users = await User.find().select('+deviceId').sort({ name: 1 });
+  // never send the device id itself, only whether one is registered
+  res.json(users.map((u) => { const o = u.toObject(); o.hasDevice = !!o.deviceId; delete o.deviceId; return o; }));
 });
 
 router.post('/', async (req, res) => {
@@ -83,12 +88,24 @@ router.put('/:id', async (req, res) => {
       if (req.body[f] !== undefined) user[f] = req.body[f];
     });
     Object.assign(user, sal.out, asg.out);
+    if (typeof req.body.deviceLock === 'boolean') user.deviceLock = req.body.deviceLock;
     if (req.body.password) user.password = req.body.password;
     await user.save();
     res.json({ id: user._id, name: user.name, email: user.email, role: user.role, active: user.active });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ message: 'Email or employee ID already exists' });
     res.status(400).json({ message: err.message });
+  }
+});
+
+// Forget the registered phone/browser: the next sign-in registers a new one
+router.post('/:id/reset-device', async (req, res) => {
+  try {
+    const r = await User.updateOne({ _id: req.params.id }, { $unset: { deviceId: 1 } });
+    if (!r.matchedCount) return res.status(404).json({ message: 'Staff member not found' });
+    res.json({ message: 'Device reset. The next sign-in will register a new phone or browser.' });
+  } catch (err) {
+    res.status(400).json({ message: 'Could not reset the device' });
   }
 });
 

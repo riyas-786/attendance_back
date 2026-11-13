@@ -5,6 +5,11 @@ const User = require('../models/User');
 const { protect, adminOnly } = require('../middleware/auth');
 const { verifyPresence } = require('../utils/presence');
 const { resolveRules } = require('../utils/rules');
+const {
+  MAX_SESSIONS_PER_DAY, normalize, openSession, recompute, secondsToWait, listSessions, detailSessions, placeText, mapUrl, plain,
+} = require('../utils/sessions');
+const { labelLocation } = require('../utils/place');
+const { checkDevice } = require('../utils/device');
 
 const router = express.Router();
 router.use(protect);
@@ -48,22 +53,31 @@ router.get('/today', async (req, res) => {
 // Check in  (body: { note?, lat?, lng?, accuracy?, qrToken? })
 router.post('/check-in', async (req, res) => {
   try {
+    const dev = await checkDevice(req.user, req.headers['x-device-id']);
+    if (!dev.ok) return res.status(dev.status).json({ message: dev.message });
+
     const rules = await resolveRules(req.user);
     const presence = verifyPresence(req.body, rules.cfg, rules.sites);
     if (!presence.ok) return res.status(presence.status).json({ message: presence.message });
 
     const now = new Date();
     const date = dayKey(now);
-    const existing = await Attendance.findOne({ user: req.user._id, date });
-    if (existing?.checkIn) return res.status(409).json({ message: 'Already checked in today' });
+    // An admin may have pre-marked the day as leave/absent; the first check-in overrides it
+    const record = normalize((await Attendance.findOne({ user: req.user._id, date })) || new Attendance({ user: req.user._id, date }));
 
-    // An admin may have pre-marked the day as leave/absent; checking in overrides it
-    const record = existing || new Attendance({ user: req.user._id, date });
-    record.checkIn = now;
-    record.status = isLate(now, rules) ? 'late' : 'present';
+    if (openSession(record)) return res.status(409).json({ message: 'You are already checked in. Check out first.' });
+    if (record.sessions.length >= MAX_SESSIONS_PER_DAY) {
+      return res.status(409).json({ message: `You can check in at most ${MAX_SESSIONS_PER_DAY} times a day.` });
+    }
+    const wait = secondsToWait(record, now);
+    if (wait > 0) return res.status(429).json({ message: `You just checked out. Please wait ${wait} seconds before checking in again.` });
+
+    // Late is decided by the first check-in of the day only
+    const first = record.sessions.length === 0;
+    record.sessions.push({ in: now, inLocation: await labelLocation(presence.location, rules.cfg), inMethod: presence.method });
+    if (first) record.status = isLate(now, rules) ? 'late' : 'present';
     record.note = req.body.note || record.note || '';
-    record.inLocation = presence.location;
-    record.inMethod = presence.method;
+    recompute(record);
     await record.save();
     res.status(201).json(record);
   } catch (err) {
@@ -74,19 +88,27 @@ router.post('/check-in', async (req, res) => {
 // Check out
 router.post('/check-out', async (req, res) => {
   try {
+    const dev = await checkDevice(req.user, req.headers['x-device-id']);
+    if (!dev.ok) return res.status(dev.status).json({ message: dev.message });
+
     const rules = await resolveRules(req.user);
     const presence = verifyPresence(req.body, rules.cfg, rules.sites);
     if (!presence.ok) return res.status(presence.status).json({ message: presence.message });
 
     const now = new Date();
-    const record = await Attendance.findOne({ user: req.user._id, date: dayKey(now) });
-    if (!record?.checkIn) return res.status(400).json({ message: 'You have not checked in today' });
-    if (record.checkOut) return res.status(409).json({ message: 'Already checked out today' });
+    const found = await Attendance.findOne({ user: req.user._id, date: dayKey(now) });
+    if (!found?.checkIn) return res.status(400).json({ message: 'You have not checked in today' });
+    const record = normalize(found);
 
-    record.checkOut = now;
-    record.workedMinutes = Math.round((now - record.checkIn) / 60000);
-    record.outLocation = presence.location;
+    const open = openSession(record);
+    if (!open) return res.status(409).json({ message: 'You are not checked in right now. Check in first.' });
+    const wait = secondsToWait(record, now);
+    if (wait > 0) return res.status(429).json({ message: `You just checked in. Please wait ${wait} seconds before checking out.` });
+
+    open.out = now;
+    open.outLocation = await labelLocation(presence.location, rules.cfg);
     if (req.body.note) record.note = req.body.note;
+    recompute(record);
     await record.save();
     res.json(record);
   } catch (err) {
@@ -156,7 +178,17 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-const COLUMNS = ['Date', 'Employee ID', 'Name', 'Department', 'Check in', 'Check out', 'Hours', 'Status', 'Method', 'Note'];
+// "08:00-12:00; 13:00-17:30" (a session still open shows "13:00-")
+const sessionsText = (r) => listSessions(r).map((s) => `${timeStr(s.in)}-${timeStr(s.out)}`).join('; ');
+
+// Check in = first check-in of the day, Check out = last check-out, Hours = total over all sessions
+// Where each session started/ended: "In: Head office (35 m) / Out: Head office (12 m); In: ..."
+const placesText = (r) =>
+  detailSessions(r)
+    .map((s) => `In: ${placeText(s.inLocation, s.inMethod)}${s.out ? ` / Out: ${placeText(s.outLocation, s.inMethod)}` : ''}`)
+    .join('; ');
+
+const COLUMNS = ['Date', 'Employee ID', 'Name', 'Department', 'Check in', 'Check out', 'Hours', 'All sessions', 'Places', 'Status', 'Method', 'Note'];
 const toRow = (r) => [
   r.date,
   r.user?.employeeId || '',
@@ -165,6 +197,8 @@ const toRow = (r) => [
   timeStr(r.checkIn),
   timeStr(r.checkOut),
   hoursStr(r.workedMinutes),
+  sessionsText(r),
+  placesText(r),
   r.status,
   r.checkIn ? r.inMethod : '',
   r.note || '',
@@ -194,7 +228,7 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
     sheet.getRow(1).font = { bold: true };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE9EEFF' } };
     sheet.views = [{ state: 'frozen', ySplit: 1 }];
-    [12, 12, 22, 16, 10, 10, 8, 10, 8, 30].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
+    [12, 12, 22, 16, 10, 10, 8, 34, 48, 10, 8, 30].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
 
     // Per-employee summary
     const by = new Map();
@@ -225,6 +259,31 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
     sum.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE9EEFF' } };
     [12, 22, 16, 9, 9, 9, 9, 12].forEach((w, i) => (sum.getColumn(i + 1).width = w));
 
+    // One row per check-in/out session with exactly where it happened
+    const loc = wb.addWorksheet('Check-in locations');
+    loc.addRow([
+      'Date', 'Employee ID', 'Name', 'Session', 'Check in', 'Check-in place', 'Distance (m)', 'Latitude', 'Longitude', 'GPS accuracy (m)', 'Map',
+      'Check out', 'Check-out place', 'Distance (m)', 'Latitude', 'Longitude', 'GPS accuracy (m)', 'Map',
+    ]);
+    const cell = (v) => (v === undefined || v === null ? '' : v);
+    const link = (l) => (mapUrl(l) ? { text: 'Open map', hyperlink: mapUrl(l) } : '');
+    for (const r of records) {
+      detailSessions(r).forEach((s, i) => {
+        const a = s.inLocation;
+        const b = s.out ? s.outLocation : undefined;
+        loc.addRow([
+          r.date, r.user?.employeeId || '', r.user?.name || '', i + 1,
+          timeStr(s.in), placeText(a, s.inMethod), cell(a?.distanceM), cell(a?.lat), cell(a?.lng), cell(a?.accuracy), link(a),
+          timeStr(s.out), s.out ? placeText(b, s.inMethod) : '', cell(b?.distanceM), cell(b?.lat), cell(b?.lng), cell(b?.accuracy), link(b),
+        ]);
+      });
+    }
+    loc.getRow(1).font = { bold: true };
+    loc.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE9EEFF' } };
+    loc.views = [{ state: 'frozen', ySplit: 1 }];
+    [12, 12, 22, 8, 10, 30, 12, 11, 11, 15, 12, 10, 30, 12, 11, 11, 15, 12].forEach((w, i) => (loc.getColumn(i + 1).width = w));
+    [11, 18].forEach((c) => loc.getColumn(c).eachCell((c2, n) => { if (n > 1 && c2.value && c2.value.hyperlink) c2.font = { color: { argb: 'FF1F3FB8' }, underline: true }; }));
+
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="attendance_${from}_to_${to}.xlsx"`);
     await wb.xlsx.write(res);
@@ -234,20 +293,63 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
   }
 });
 
-// Admin manually creates/corrects a record (e.g. mark leave or fix a missed check-out)
+// Admin manually creates/corrects a record (e.g. mark leave, or fix a day's check-in/out times).
+// To correct times send `sessions: [{ in, out }, ...]` (replaces all of the day's sessions).
+// The older `checkIn` / `checkOut` fields still work: they change the first check-in / last check-out.
 router.put('/manual', adminOnly, async (req, res) => {
   try {
-    const { userId, date, checkIn, checkOut, status, note, leaveType } = req.body;
+    const { userId, date, checkIn, checkOut, sessions, status, note, leaveType } = req.body;
     if (!userId || !date) return res.status(400).json({ message: 'userId and date are required' });
 
-    const record = (await Attendance.findOne({ user: userId, date })) || new Attendance({ user: userId, date });
-    if (checkIn !== undefined) record.checkIn = checkIn ? new Date(checkIn) : undefined;
-    if (checkOut !== undefined) record.checkOut = checkOut ? new Date(checkOut) : undefined;
+    const record = normalize((await Attendance.findOne({ user: userId, date })) || new Attendance({ user: userId, date }));
+
+    if (sessions !== undefined) {
+      if (!Array.isArray(sessions) || sessions.length > MAX_SESSIONS_PER_DAY) {
+        return res.status(400).json({ message: `Sessions must be a list of at most ${MAX_SESSIONS_PER_DAY}` });
+      }
+      const before = new Map(record.sessions.map((x) => [new Date(x.in).getTime(), x]));
+      const built = [];
+      for (const s of sessions) {
+        const inAt = new Date(s?.in);
+        const outAt = s?.out ? new Date(s.out) : undefined;
+        if (Number.isNaN(inAt.getTime()) || (outAt && Number.isNaN(outAt.getTime()))) {
+          return res.status(400).json({ message: 'Each session needs a valid check-in time (and a valid check-out time if given)' });
+        }
+        if (outAt && outAt < inAt) return res.status(400).json({ message: 'A check-out cannot be before its check-in' });
+        // a session whose check-in time is unchanged keeps where it happened; anything typed in by the admin is marked as such
+        const prev = before.get(inAt.getTime());
+        const sameOut = prev && prev.out && outAt && new Date(prev.out).getTime() === outAt.getTime();
+        built.push({
+          in: inAt,
+          out: outAt,
+          inMethod: prev ? prev.inMethod : 'admin',
+          inLocation: prev ? plain(prev.inLocation) : undefined,
+          outLocation: sameOut ? plain(prev.outLocation) : undefined,
+        });
+      }
+      built.sort((a, b) => a.in - b.in);
+      for (let i = 0; i < built.length; i++) {
+        const next = built[i + 1];
+        if (next && (!built[i].out || built[i].out > next.in)) {
+          return res.status(400).json({ message: 'Sessions cannot overlap, and only the last one can be left open' });
+        }
+      }
+      record.sessions = built;
+    } else if (checkIn !== undefined || checkOut !== undefined) {
+      if (checkIn !== undefined) {
+        if (!checkIn) record.sessions = [];
+        else if (!record.sessions.length) record.sessions.push({ in: new Date(checkIn), inMethod: 'admin' });
+        else record.sessions[0].in = new Date(checkIn);
+      }
+      if (checkOut !== undefined && record.sessions.length) {
+        record.sessions[record.sessions.length - 1].out = checkOut ? new Date(checkOut) : undefined;
+      }
+    }
+
     if (status) record.status = status;
     if (leaveType && ['annual', 'sick', 'unpaid', 'other'].includes(leaveType)) record.leaveType = leaveType;
     if (note !== undefined) record.note = note;
-    record.workedMinutes =
-      record.checkIn && record.checkOut ? Math.round((record.checkOut - record.checkIn) / 60000) : 0;
+    recompute(record);
     await record.save();
     res.json(record);
   } catch (err) {

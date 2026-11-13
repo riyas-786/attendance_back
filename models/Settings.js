@@ -19,6 +19,8 @@ const settingsSchema = new mongoose.Schema(
     lateCountThreshold: Number,
     lateDeductionDays: Number,
     salaryCurrency: String,
+    payrollStartDay: Number,
+    payHoursPerDay: Number,
   },
   { timestamps: true, minimize: false }
 );

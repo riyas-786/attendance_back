@@ -17,6 +17,7 @@ app.use('/api/staff', require('./routes/staff'));
 app.use('/api/leaves', require('./routes/leaves'));
 app.use('/api/qr', require('./routes/qr'));
 app.use('/api/payroll', require('./routes/payroll'));
+app.use('/api/adjustments', require('./routes/adjustments'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/locations', require('./routes/locations'));
 app.use('/api/shifts', require('./routes/shifts'));

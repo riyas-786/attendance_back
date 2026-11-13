@@ -10,7 +10,9 @@ const userSchema = new mongoose.Schema(
     department: { type: String, trim: true, default: '' },
     employeeId: { type: String, trim: true, unique: true, sparse: true },
     active: { type: Boolean, default: true },
-    // Monthly salary used by the payroll page
+    // How this person is paid: a fixed monthly salary, a rate per day worked, or a rate per hour worked.
+    payType: { type: String, enum: ['monthly', 'daily', 'hourly'], default: 'monthly' },
+    // The amount for payType: monthly salary / rate per day / rate per hour
     baseSalary: { type: Number, min: 0, default: 0 },
     // YYYY-MM-DD. Days before this are not counted as absences. Leave empty to count the whole month.
     joinDate: { type: String, default: '' },
@@ -20,6 +22,9 @@ const userSchema = new mongoose.Schema(
     locations: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Location' }],
     // Field/remote staff: no location check at all.
     anyLocation: { type: Boolean, default: false },
+    // The one phone/browser this person may use (registered on first sign-in). See utils/device.js.
+    deviceId: { type: String, default: undefined, select: false },
+    deviceLock: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
@@ -33,5 +38,8 @@ userSchema.pre('save', async function (next) {
 userSchema.methods.comparePassword = function (plain) {
   return bcrypt.compare(plain, this.password);
 };
+
+// unique among people who have one; sparse so unregistered accounts do not clash
+userSchema.index({ deviceId: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model('User', userSchema);

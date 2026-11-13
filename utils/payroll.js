@@ -1,7 +1,8 @@
 // Pure calculation, no database access, so it is easy to test.
 // `s` is the settings object from utils/settings.js getSettings().
 
-const pad = (n) => String(n).padStart(2, '0');
+const { monthPeriod, datesBetween } = require('./period');
+
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 function payrollCfg(s) {
@@ -14,33 +15,31 @@ function payrollCfg(s) {
     lateThreshold: Number.isFinite(threshold) && threshold > 0 ? threshold : 0,
     lateDays: Number.isFinite(Number(s.lateDeductionDays)) ? Number(s.lateDeductionDays) : 0.5,
     currency: s.salaryCurrency || 'AED',
+    hoursPerDay: Number(s.payHoursPerDay) > 0 ? Number(s.payHoursPerDay) : 8,
   };
 }
 
-// All working days (YYYY-MM-DD) in a month, excluding weekends and holidays
-function workingDaysOf(month, cfg) {
-  const [y, m] = month.split('-').map(Number);
-  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  const out = [];
-  for (let d = 1; d <= daysInMonth; d++) {
-    const key = `${y}-${pad(m)}-${pad(d)}`;
-    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
-    if (cfg.weekend.includes(dow) || cfg.holidays.has(key)) continue;
-    out.push(key);
-  }
-  return out;
+// All working days (YYYY-MM-DD) from..to inclusive, excluding weekends and holidays
+function workingDaysIn(from, to, cfg) {
+  return datesBetween(from, to).filter((key) => {
+    const dow = new Date(`${key}T00:00:00Z`).getUTCDay();
+    return !cfg.weekend.includes(dow) && !cfg.holidays.has(key);
+  });
 }
 
 /**
- * month   'YYYY-MM'
+ * period  { key, from, to } (see utils/period.js), or a 'YYYY-MM' pay month
  * users   [{ _id, name, employeeId, department, baseSalary, joinDate }]
  * records Attendance docs (or plain objects) for the month: { user, date, checkIn, status, leaveType }
  * today   'YYYY-MM-DD' (server date). Days from today onwards are not judged yet.
  * s       settings (see above)
+ * adjustments [{ user, month, type: 'earning'|'deduction', label, amount, note }] for this month
  */
-function computePayroll(month, users, records, today, s) {
+function computePayroll(periodIn, users, records, today, s, adjustments = []) {
   const cfg = payrollCfg(s);
-  const workingDays = workingDaysOf(month, cfg);
+  const period = typeof periodIn === 'string' ? monthPeriod(periodIn, s.payrollStartDay) : periodIn;
+  const month = period.key;
+  const workingDays = workingDaysIn(period.from, period.to, cfg);
   const totalWorkingDays = workingDays.length;
 
   const byUser = new Map();
@@ -50,48 +49,104 @@ function computePayroll(month, users, records, today, s) {
     byUser.get(id).set(r.date, r);
   }
 
+  const adjByUser = new Map();
+  for (const a of adjustments) {
+    // a dated entry counts in the period that contains its day; an older undated one belongs to its period key
+    if (a.date) { if (a.date < period.from || a.date > period.to) continue; }
+    else if (a.month && a.month !== month) continue;
+    const id = String(a.user?._id || a.user);
+    if (!adjByUser.has(id)) adjByUser.set(id, []);
+    adjByUser.get(id).push(a);
+  }
+
   const rows = users.map((u) => {
     const recs = byUser.get(String(u._id)) || new Map();
-    const base = Number(u.baseSalary) || 0;
-    const dailyRate = totalWorkingDays ? base / totalWorkingDays : 0;
+    const payType = ['daily', 'hourly'].includes(u.payType) ? u.payType : 'monthly';
+    const rate = Number(u.baseSalary) || 0;
 
+    let basic; // pay earned before deductions
+    let dailyRate;
     let counted = 0; // working days that are in scope for this employee
     let worked = 0;
     let paidLeave = 0;
     let unpaidLeave = 0;
     let absent = 0;
     let late = 0;
+    let hours = 0;
+    let paidDays = 0;
 
-    for (const date of workingDays) {
-      if (u.joinDate && date < u.joinDate) continue; // not employed yet
-      counted += 1;
-      const r = recs.get(date);
+    if (payType === 'monthly') {
+      basic = rate;
+      dailyRate = totalWorkingDays ? rate / totalWorkingDays : 0;
+      for (const date of workingDays) {
+        if (u.joinDate && date < u.joinDate) continue; // not employed yet
+        counted += 1;
+        const r = recs.get(date);
 
-      if (r?.checkIn) {
-        worked += 1;
-        if (r.status === 'late') late += 1;
-        continue;
+        if (r?.checkIn) {
+          worked += 1;
+          if (r.status === 'late') late += 1;
+          continue;
+        }
+        if (r?.status === 'leave') {
+          if (r.leaveType === 'unpaid') unpaidLeave += 1;
+          else paidLeave += 1;
+          continue;
+        }
+        // Today and future days are not judged: the person may still check in
+        if (date >= today && r?.status !== 'absent') continue;
+        absent += 1;
       }
-      if (r?.status === 'leave') {
-        if (r.leaveType === 'unpaid') unpaidLeave += 1;
-        else paidLeave += 1;
-        continue;
+    } else {
+      // Paid only for what was worked: every day with a check-in counts (weekends and holidays too),
+      // and approved paid leave is paid as a normal day. Absences simply earn nothing.
+      let minutes = 0;
+      for (const [date, r] of recs) {
+        if (u.joinDate && date < u.joinDate) continue;
+        if (r.checkIn) {
+          worked += 1;
+          if (r.status === 'late') late += 1;
+          minutes += Number(r.workedMinutes) || 0;
+        } else if (r.status === 'leave' && r.leaveType !== 'unpaid') {
+          paidLeave += 1;
+        }
       }
-      // Today and future days are not judged: the person may still check in
-      if (date >= today && r?.status !== 'absent') continue;
-      absent += 1;
+      counted = totalWorkingDays;
+      hours = round2(minutes / 60);
+      paidDays = worked + paidLeave;
+      if (payType === 'daily') {
+        dailyRate = rate;
+        basic = rate * paidDays;
+      } else {
+        dailyRate = rate * cfg.hoursPerDay; // what one normal day is worth
+        basic = rate * (minutes / 60) + paidLeave * dailyRate;
+      }
     }
+    basic = round2(basic);
 
     const lateBlocks = cfg.lateThreshold ? Math.floor(late / cfg.lateThreshold) : 0;
     const lateDeductionDays = lateBlocks * cfg.lateDays;
-    const deductionDays = absent * cfg.factor + unpaidLeave + lateDeductionDays;
-    const deduction = round2(Math.min(deductionDays * dailyRate, base));
+    // monthly: absences and unpaid leave are deducted from the fixed salary; daily/hourly: they are just not paid
+    const deductionDays = (payType === 'monthly' ? absent * cfg.factor + unpaidLeave : 0) + lateDeductionDays;
+    const deduction = round2(Math.min(deductionDays * dailyRate, basic));
+
+    // extra earnings (overtime, incentive ...) and extra deductions (advance ...)
+    const adj = (adjByUser.get(String(u._id)) || []).slice().sort((x, y) => String(x.date || '').localeCompare(String(y.date || ''))).map((a) => ({
+      id: a._id, date: a.date || '', type: a.type, label: a.label, amount: round2(Number(a.amount) || 0), note: a.note || '',
+    }));
+    const additions = round2(adj.filter((a) => a.type === 'earning').reduce((t, a) => t + a.amount, 0));
+    const otherDeductions = round2(adj.filter((a) => a.type === 'deduction').reduce((t, a) => t + a.amount, 0));
+    const rawNet = round2(basic - deduction + additions - otherDeductions);
     return {
       userId: u._id,
       name: u.name,
       employeeId: u.employeeId || '',
       department: u.department || '',
-      baseSalary: round2(base),
+      payType,
+      rate: round2(rate), // monthly salary, rate per day or rate per hour, depending on payType
+      baseSalary: basic, // pay earned before deductions (= the salary for monthly staff)
+      paidDays, // daily and hourly staff: days worked + paid leave
+      hours, // hourly staff: hours worked
       workingDays: counted,
       worked,
       paidLeave,
@@ -101,7 +156,12 @@ function computePayroll(month, users, records, today, s) {
       lateDeductionDays,
       dailyRate: round2(dailyRate),
       deduction,
-      netSalary: round2(base - deduction),
+      additions,
+      otherDeductions,
+      adjustments: adj,
+      netSalary: Math.max(0, rawNet),
+      // when advances etc. are bigger than what is owed, the rest is not paid out as a negative
+      shortfall: rawNet < 0 ? round2(-rawNet) : 0,
     };
   });
 
@@ -109,23 +169,29 @@ function computePayroll(month, users, records, today, s) {
     (t, r) => ({
       baseSalary: round2(t.baseSalary + r.baseSalary),
       deduction: round2(t.deduction + r.deduction),
+      additions: round2(t.additions + r.additions),
+      otherDeductions: round2(t.otherDeductions + r.otherDeductions),
       netSalary: round2(t.netSalary + r.netSalary),
     }),
-    { baseSalary: 0, deduction: 0, netSalary: 0 }
+    { baseSalary: 0, deduction: 0, additions: 0, otherDeductions: 0, netSalary: 0 }
   );
 
   return {
     month,
+    from: period.from,
+    to: period.to,
+    custom: !!period.custom,
     currency: cfg.currency,
     totalWorkingDays,
     deductionFactor: cfg.factor,
     lateThreshold: cfg.lateThreshold,
     lateDays: cfg.lateDays,
+    hoursPerDay: cfg.hoursPerDay,
     // true while the month is still running: figures are "so far", not final
-    inProgress: today.slice(0, 7) <= month,
+    inProgress: today <= period.to,
     rows,
     totals,
   };
 }
 
-module.exports = { computePayroll, workingDaysOf, payrollCfg };
+module.exports = { computePayroll, workingDaysIn, payrollCfg };

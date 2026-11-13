@@ -8,7 +8,7 @@ exports.protect = async (req, res, next) => {
     if (!token) return res.status(401).json({ message: 'Not authenticated' });
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(payload.id);
+    const user = await User.findById(payload.id).select('+deviceId');
     if (!user || !user.active) return res.status(401).json({ message: 'Account not available' });
 
     req.user = user;
