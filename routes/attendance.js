@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const ExcelJS = require('exceljs');
 const Attendance = require('../models/Attendance');
 const User = require('../models/User');
@@ -10,6 +11,9 @@ const {
 } = require('../utils/sessions');
 const { labelLocation } = require('../utils/place');
 const { checkDevice } = require('../utils/device');
+const { getSettings } = require('../utils/settings');
+const { payrollCfg, workingDaysIn } = require('../utils/payroll');
+const { isRealDate } = require('../utils/period');
 
 const router = express.Router();
 router.use(protect);
@@ -33,7 +37,6 @@ router.get('/rules', async (req, res) => {
     const rules = await resolveRules(req.user);
     res.json({
       locationRequired: !!rules.sites,
-      qrRequired: !!rules.cfg.requireQr,
       workStart: rules.workStart,
       graceMinutes: rules.graceMinutes,
       shiftName: rules.shiftName,
@@ -50,7 +53,7 @@ router.get('/today', async (req, res) => {
   res.json(record);
 });
 
-// Check in  (body: { note?, lat?, lng?, accuracy?, qrToken? })
+// Check in  (body: { note?, lat?, lng?, accuracy? })
 router.post('/check-in', async (req, res) => {
   try {
     const dev = await checkDevice(req.user, req.headers['x-device-id']);
@@ -146,10 +149,10 @@ router.get('/', adminOnly, async (req, res) => {
 // Daily summary: present / late / on leave / not yet in
 router.get('/summary', adminOnly, async (req, res) => {
   const date = req.query.date || dayKey();
-  const [totalStaff, records] = await Promise.all([
-    User.countDocuments({ role: 'staff', active: true }),
-    Attendance.find({ date }),
-  ]);
+  // only people who are on the staff list today: records of removed or admin accounts must not hide a missing person
+  const staffIds = (await User.find({ role: 'staff', active: true }).select('_id')).map((u) => u._id);
+  const totalStaff = staffIds.length;
+  const records = await Attendance.find({ date, user: { $in: staffIds } });
   const count = (s) => records.filter((r) => r.status === s).length;
   const present = count('present');
   const late = count('late');
@@ -159,14 +162,78 @@ router.get('/summary', adminOnly, async (req, res) => {
 
 // ---- Reports ----
 
+const STATUSES = ['present', 'late', 'leave', 'absent'];
+
+class BadFilter extends Error {}
+
+/**
+ * Report filters (all optional, all combine):
+ *   from, to        date range (YYYY-MM-DD)
+ *   userId          one employee
+ *   department      exact department name
+ *   shift           shift id
+ *   status          comma list of present,late,leave,absent
+ *   place           a saved location name, or "__none__" = check-ins that were not at any saved place
+ *   includeAbsent   "true" = also list working days with no record at all as absent (active staff, up to yesterday)
+ */
 async function loadReportRows(query) {
   const now = new Date();
   const from = query.from || `${now.getFullYear()}-${pad(now.getMonth() + 1)}-01`;
   const to = query.to || dayKey(now);
+  if (!isRealDate(from) || !isRealDate(to)) throw new BadFilter('From and to must be dates (YYYY-MM-DD)');
+  if (from > to) throw new BadFilter('The From date must not be after the To date');
   const filter = { date: { $gte: from, $lte: to } };
-  if (query.userId) filter.user = query.userId;
 
-  const records = await Attendance.find(filter).populate('user', 'name email department employeeId');
+  const isId = (v) => mongoose.isValidObjectId(String(v));
+  if (query.userId && !isId(query.userId)) throw new BadFilter('Invalid staff member');
+  if (query.shift && !isId(query.shift)) throw new BadFilter('Invalid shift');
+
+  // who: employee / department / shift narrow down the list of people
+  let userIds = null;
+  if (query.userId) userIds = [String(query.userId)];
+  if (query.department || query.shift) {
+    const who = {};
+    if (query.department) who.department = String(query.department);
+    if (query.shift) who.shift = query.shift;
+    const ids = (await User.find(who).select('_id')).map((u) => String(u._id));
+    userIds = userIds ? userIds.filter((id) => ids.includes(id)) : ids;
+  }
+  if (userIds) filter.user = { $in: userIds };
+
+  const statuses = String(query.status || '').split(',').map((x) => x.trim()).filter((x) => STATUSES.includes(x));
+  if (statuses.length) filter.status = { $in: statuses };
+
+  let records = await Attendance.find(filter).populate('user', 'name email department employeeId');
+
+  // working days where someone has no record at all count as absent
+  if (String(query.includeAbsent) === 'true' && (!statuses.length || statuses.includes('absent'))) {
+    const cfg = payrollCfg(await getSettings());
+    const staffFilter = { role: 'staff', active: true };
+    if (userIds) staffFilter._id = { $in: userIds };
+    const staff = await User.find(staffFilter);
+    const today = dayKey(now);
+    const days = workingDaysIn(from, to, cfg).filter((d) => d < today); // today may still be checked in
+    // a day counts as "has a record" whatever its status, so look at all records, not just the filtered ones
+    const base = { date: { $gte: from, $lte: to } };
+    if (userIds) base.user = { $in: userIds };
+    const existing = statuses.length ? await Attendance.find(base).select('user date') : records;
+    const have = new Set(existing.map((r) => `${String(r.user?._id || r.user)}|${r.date}`));
+    for (const u of staff) {
+      for (const d of days) {
+        if (u.joinDate && d < u.joinDate) continue;
+        if (have.has(`${String(u._id)}|${d}`)) continue;
+        records.push({ date: d, user: u, status: 'absent', sessions: [], workedMinutes: 0, note: 'No record (absent)' });
+      }
+    }
+  }
+
+  if (query.place) {
+    records = records.filter((r) => {
+      const names = detailSessions(r).flatMap((x) => [x.inLocation?.siteName, x.out ? x.outLocation?.siteName : undefined]).filter(Boolean);
+      return query.place === '__none__' ? !!r.checkIn && names.length === 0 : names.includes(String(query.place));
+    });
+  }
+
   records.sort((a, b) => a.date.localeCompare(b.date) || (a.user?.name || '').localeCompare(b.user?.name || ''));
   return { from, to, records };
 }
@@ -188,7 +255,7 @@ const placesText = (r) =>
     .map((s) => `In: ${placeText(s.inLocation, s.inMethod)}${s.out ? ` / Out: ${placeText(s.outLocation, s.inMethod)}` : ''}`)
     .join('; ');
 
-const COLUMNS = ['Date', 'Employee ID', 'Name', 'Department', 'Check in', 'Check out', 'Hours', 'All sessions', 'Places', 'Status', 'Method', 'Note'];
+const COLUMNS = ['Date', 'Employee ID', 'Name', 'Department', 'Check in', 'Check out', 'Hours', 'All sessions', 'Places', 'Status', 'Leave type', 'Method', 'Note'];
 const toRow = (r) => [
   r.date,
   r.user?.employeeId || '',
@@ -200,6 +267,7 @@ const toRow = (r) => [
   sessionsText(r),
   placesText(r),
   r.status,
+  r.status === 'leave' ? (r.leaveType === 'unpaid' ? 'Unpaid' : 'Paid') + (r.leaveType && r.leaveType !== 'unpaid' ? ` (${r.leaveType})` : '') : '',
   r.checkIn ? r.inMethod : '',
   r.note || '',
 ];
@@ -213,6 +281,25 @@ router.get('/export.csv', adminOnly, async (req, res) => {
     // BOM so Excel opens UTF-8 (Arabic names etc.) correctly
     res.send('﻿' + lines.join('\r\n'));
   } catch (err) {
+    if (err instanceof BadFilter) return res.status(400).json({ message: err.message });
+    res.status(500).json({ message: 'Could not build report' });
+  }
+});
+
+// The same rows as the downloads, as JSON, so the Reports page can preview what the filters match
+router.get('/report', adminOnly, async (req, res) => {
+  try {
+    const { from, to, records } = await loadReportRows(req.query);
+    const LIMIT = 500;
+    const counts = { present: 0, late: 0, leave: 0, absent: 0 };
+    let minutes = 0;
+    for (const r of records) {
+      if (counts[r.status] !== undefined) counts[r.status] += 1;
+      minutes += r.workedMinutes || 0;
+    }
+    res.json({ from, to, total: records.length, counts, hours: Number((minutes / 60).toFixed(2)), columns: COLUMNS, rows: records.slice(0, LIMIT).map(toRow), limit: LIMIT });
+  } catch (err) {
+    if (err instanceof BadFilter) return res.status(400).json({ message: err.message });
     res.status(500).json({ message: 'Could not build report' });
   }
 });
@@ -228,7 +315,7 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
     sheet.getRow(1).font = { bold: true };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE9EEFF' } };
     sheet.views = [{ state: 'frozen', ySplit: 1 }];
-    [12, 12, 22, 16, 10, 10, 8, 34, 48, 10, 8, 30].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
+    [12, 12, 22, 16, 10, 10, 8, 34, 48, 10, 14, 8, 30].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
 
     // Per-employee summary
     const by = new Map();
@@ -289,7 +376,10 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
     await wb.xlsx.write(res);
     res.end();
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ message: 'Could not build report' });
+    if (!res.headersSent) {
+      if (err instanceof BadFilter) return res.status(400).json({ message: err.message });
+      res.status(500).json({ message: 'Could not build report' });
+    }
   }
 });
 

@@ -16,6 +16,7 @@ function payrollCfg(s) {
     lateDays: Number.isFinite(Number(s.lateDeductionDays)) ? Number(s.lateDeductionDays) : 0.5,
     currency: s.salaryCurrency || 'AED',
     hoursPerDay: Number(s.payHoursPerDay) > 0 ? Number(s.payHoursPerDay) : 8,
+    monthlyMethod: s.monthlyMethod === 'days' ? 'days' : 'fixed',
   };
 }
 
@@ -74,9 +75,10 @@ function computePayroll(periodIn, users, records, today, s, adjustments = []) {
     let late = 0;
     let hours = 0;
     let paidDays = 0;
+    const method = payType === 'monthly' ? (u.monthlyMethod === 'fixed' || u.monthlyMethod === 'days' ? u.monthlyMethod : cfg.monthlyMethod) : '';
 
     if (payType === 'monthly') {
-      basic = rate;
+      basic = rate; // fixed salary; only absences, unpaid leave and late arrivals are deducted
       dailyRate = totalWorkingDays ? rate / totalWorkingDays : 0;
       for (const date of workingDays) {
         if (u.joinDate && date < u.joinDate) continue; // not employed yet
@@ -96,6 +98,11 @@ function computePayroll(periodIn, users, records, today, s, adjustments = []) {
         // Today and future days are not judged: the person may still check in
         if (date >= today && r?.status !== 'absent') continue;
         absent += 1;
+      }
+      // 'days' method: paid only for the days present (and paid leave) at salary / working days
+      if (method === 'days') {
+        paidDays = worked + paidLeave;
+        basic = dailyRate * paidDays;
       }
     } else {
       // Paid only for what was worked: every day with a check-in counts (weekends and holidays too),
@@ -127,7 +134,7 @@ function computePayroll(periodIn, users, records, today, s, adjustments = []) {
     const lateBlocks = cfg.lateThreshold ? Math.floor(late / cfg.lateThreshold) : 0;
     const lateDeductionDays = lateBlocks * cfg.lateDays;
     // monthly: absences and unpaid leave are deducted from the fixed salary; daily/hourly: they are just not paid
-    const deductionDays = (payType === 'monthly' ? absent * cfg.factor + unpaidLeave : 0) + lateDeductionDays;
+    const deductionDays = (method === 'fixed' ? absent * cfg.factor + unpaidLeave : 0) + lateDeductionDays;
     const deduction = round2(Math.min(deductionDays * dailyRate, basic));
 
     // extra earnings (overtime, incentive ...) and extra deductions (advance ...)
@@ -143,6 +150,7 @@ function computePayroll(periodIn, users, records, today, s, adjustments = []) {
       employeeId: u.employeeId || '',
       department: u.department || '',
       payType,
+      payMethod: method, // monthly staff: 'fixed' or 'days'
       rate: round2(rate), // monthly salary, rate per day or rate per hour, depending on payType
       baseSalary: basic, // pay earned before deductions (= the salary for monthly staff)
       paidDays, // daily and hourly staff: days worked + paid leave

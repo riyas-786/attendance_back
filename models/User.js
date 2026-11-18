@@ -11,6 +11,8 @@ const userSchema = new mongoose.Schema(
     employeeId: { type: String, trim: true, unique: true, sparse: true },
     active: { type: Boolean, default: true },
     // How this person is paid: a fixed monthly salary, a rate per day worked, or a rate per hour worked.
+    // monthly staff only: '' = use the Settings default, 'fixed' = full salary minus absences, 'days' = salary / working days x days present
+    monthlyMethod: { type: String, enum: ['', 'fixed', 'days'], default: '' },
     payType: { type: String, enum: ['monthly', 'daily', 'hourly'], default: 'monthly' },
     // The amount for payType: monthly salary / rate per day / rate per hour
     baseSalary: { type: Number, min: 0, default: 0 },

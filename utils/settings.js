@@ -11,9 +11,6 @@ const ENV = {
   officeLat: 'OFFICE_LAT',
   officeLng: 'OFFICE_LNG',
   officeRadiusMeters: 'OFFICE_RADIUS_METERS',
-  requireQr: 'REQUIRE_QR',
-  qrWindowMinutes: 'QR_WINDOW_MINUTES',
-  frontendUrl: 'FRONTEND_URL',
   weekendDays: 'WEEKEND_DAYS',
   holidays: 'HOLIDAYS',
   absentDeductionFactor: 'ABSENT_DEDUCTION_FACTOR',
@@ -22,6 +19,7 @@ const ENV = {
   salaryCurrency: 'SALARY_CURRENCY',
   payrollStartDay: 'PAYROLL_START_DAY',
   payHoursPerDay: 'PAY_HOURS_PER_DAY',
+  monthlyMethod: 'MONTHLY_METHOD',
 };
 
 const num = (v, fallback) => {
@@ -42,9 +40,6 @@ function envDefaults() {
     officeLat: optNum(e.OFFICE_LAT),
     officeLng: optNum(e.OFFICE_LNG),
     officeRadiusMeters: num(e.OFFICE_RADIUS_METERS, 200),
-    requireQr: String(e.REQUIRE_QR).toLowerCase() === 'true',
-    qrWindowMinutes: num(e.QR_WINDOW_MINUTES, 5),
-    frontendUrl: e.FRONTEND_URL || 'http://localhost:4200',
     weekendDays: (e.WEEKEND_DAYS ?? '0,6').split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number),
     holidays: (e.HOLIDAYS || '').split(',').map((s) => s.trim()).filter(Boolean).sort(),
     absentDeductionFactor: num(e.ABSENT_DEDUCTION_FACTOR, 1),
@@ -53,6 +48,7 @@ function envDefaults() {
     salaryCurrency: e.SALARY_CURRENCY || 'AED',
     payrollStartDay: num(e.PAYROLL_START_DAY, 1),
     payHoursPerDay: num(e.PAY_HOURS_PER_DAY, 8),
+    monthlyMethod: e.MONTHLY_METHOD === 'days' ? 'days' : 'fixed',
   };
 }
 
@@ -97,20 +93,6 @@ function validate(input = {}, base = envDefaults()) {
     v.officeRadiusMeters = n;
   }
 
-  if (has('requireQr')) {
-    if (typeof input.requireQr !== 'boolean') return { error: 'Require QR must be true or false' };
-    v.requireQr = input.requireQr;
-  }
-  if (has('qrWindowMinutes')) {
-    const n = Number(input.qrWindowMinutes);
-    if (!Number.isInteger(n) || n < 1 || n > 60) return { error: 'QR refresh time must be a whole number from 1 to 60 minutes' };
-    v.qrWindowMinutes = n;
-  }
-  if (has('frontendUrl')) {
-    const u = String(input.frontendUrl).trim();
-    if (!/^https?:\/\/[^\s]+$/i.test(u)) return { error: 'App address must start with http:// or https://' };
-    v.frontendUrl = u.replace(/\/+$/, '');
-  }
 
   if (has('weekendDays')) {
     const d = input.weekendDays;
@@ -152,6 +134,10 @@ function validate(input = {}, base = envDefaults()) {
     const n = Number(input.payHoursPerDay);
     if (!isNum(n) || n <= 0 || n > 24) return { error: 'Hours in a paid day must be more than 0 and at most 24' };
     v.payHoursPerDay = n;
+  }
+  if (has('monthlyMethod')) {
+    if (!['fixed', 'days'].includes(input.monthlyMethod)) return { error: 'Monthly pay method must be fixed or days' };
+    v.monthlyMethod = input.monthlyMethod;
   }
   return { values: v };
 }

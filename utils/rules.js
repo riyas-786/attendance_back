@@ -5,7 +5,7 @@ const { getSettings } = require('./settings');
 
 /**
  * Returns {
- *   cfg,            global settings (QR rules, etc.)
+ *   cfg,            global settings
  *   workStart,      'HH:MM'
  *   graceMinutes,   number
  *   shiftName,      string | ''

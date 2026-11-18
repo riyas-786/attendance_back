@@ -13,6 +13,10 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // Normalises the optional salary fields; returns { error } for bad input
 function salaryFields(body) {
   const out = {};
+  if (body.monthlyMethod !== undefined) {
+    if (!['', 'fixed', 'days'].includes(body.monthlyMethod)) return { error: 'Monthly pay method must be fixed or days' };
+    out.monthlyMethod = body.monthlyMethod;
+  }
   if (body.payType !== undefined) {
     if (!['monthly', 'daily', 'hourly'].includes(body.payType)) return { error: 'Pay type must be monthly, daily or hourly' };
     out.payType = body.payType;

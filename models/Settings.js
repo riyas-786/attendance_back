@@ -10,9 +10,6 @@ const settingsSchema = new mongoose.Schema(
     officeLat: Number,
     officeLng: Number,
     officeRadiusMeters: Number,
-    requireQr: Boolean,
-    qrWindowMinutes: Number,
-    frontendUrl: String,
     weekendDays: [Number],
     holidays: [String],
     absentDeductionFactor: Number,
@@ -21,6 +18,7 @@ const settingsSchema = new mongoose.Schema(
     salaryCurrency: String,
     payrollStartDay: Number,
     payHoursPerDay: Number,
+    monthlyMethod: String,
   },
   { timestamps: true, minimize: false }
 );

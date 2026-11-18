@@ -1,9 +1,8 @@
 // Helpers for the several check-in/check-out sessions a person can have in one day.
 
 const MAX_SESSIONS_PER_DAY = 20;
-// Stops accidental double actions (e.g. scanning the QR code twice, or reloading the scan page,
-// which would otherwise check the person straight back out).
-const MIN_SECONDS_BETWEEN_ACTIONS = 60;
+// Stops accidental double actions (e.g. pressing the button twice).
+const MIN_SECONDS_BETWEEN_ACTIONS = 0; // no waiting between check-in and check-out (was 60)
 
 const plain = (v) => (v && typeof v.toObject === 'function' ? v.toObject() : v);
 
