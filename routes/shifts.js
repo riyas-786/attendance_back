@@ -10,12 +10,15 @@ router.use(protect, adminOnly);
 function clean(body) {
   const name = String(body.name || '').trim();
   const workStart = String(body.workStart || '');
+  const workEnd = String(body.workEnd || '');
   const graceMinutes = body.graceMinutes === undefined || body.graceMinutes === '' ? 0 : Number(body.graceMinutes);
   if (!name || name.length > 60) return { error: 'Name is required (up to 60 characters)' };
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(workStart)) return { error: 'Start time must be HH:MM (24-hour)' };
+  if (workEnd && !/^([01]\d|2[0-3]):[0-5]\d$/.test(workEnd)) return { error: 'End time must be HH:MM (24-hour)' };
+  if (workEnd && workEnd === workStart) return { error: 'End time must be different from the start time' };
   if (!Number.isInteger(graceMinutes) || graceMinutes < 0 || graceMinutes > 240)
     return { error: 'Grace period must be a whole number from 0 to 240 minutes' };
-  return { value: { name, workStart, graceMinutes } };
+  return { value: { name, workStart, workEnd, graceMinutes } };
 }
 
 router.get('/', async (req, res) => {

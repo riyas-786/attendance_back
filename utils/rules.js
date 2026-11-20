@@ -19,6 +19,9 @@ async function resolveRules(user) {
 
   const shift = user.shift || null;
   const workStart = shift ? shift.workStart : cfg.workStart;
+  const workEnd = shift ? shift.workEnd || '' : '';
+  const toMin = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+  const overnight = !!workEnd && toMin(workEnd) <= toMin(workStart); // runs past midnight
   const graceMinutes = shift ? Number(shift.graceMinutes) || 0 : Number(cfg.lateGraceMinutes) || 0;
 
   let sites;
@@ -32,7 +35,7 @@ async function resolveRules(user) {
     sites = null;
   }
 
-  return { cfg, workStart, graceMinutes, shiftName: shift ? shift.name : '', sites };
+  return { cfg, workStart, workEnd, overnight, graceMinutes, shiftName: shift ? shift.name : '', sites };
 }
 
 module.exports = { resolveRules };

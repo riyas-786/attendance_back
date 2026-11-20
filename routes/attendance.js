@@ -25,10 +25,40 @@ const hoursStr = (mins) => (mins ? (mins / 60).toFixed(2) : '');
 
 // `rules` comes from resolveRules(): this person's own duty time
 function isLate(now, rules) {
+  if (rules.overnight) {
+    // e.g. 21:00 to 07:00: arriving after midnight (before the shift ends) is late for the shift that started yesterday
+    const mins = now.getHours() * 60 + now.getMinutes();
+    const end = Number(rules.workEnd.slice(0, 2)) * 60 + Number(rules.workEnd.slice(3, 5));
+    if (mins < end) return true;
+    const start = Number(rules.workStart.slice(0, 2)) * 60 + Number(rules.workStart.slice(3, 5));
+    return mins > start + rules.graceMinutes;
+  }
   const [h, m] = rules.workStart.split(':').map(Number);
   const limit = new Date(now);
   limit.setHours(h, m + rules.graceMinutes, 0, 0);
   return now > limit;
+}
+
+// A shift that runs past midnight belongs to the day it STARTED: arriving at 00:30 for a 21:00 shift counts for yesterday.
+function attendanceDate(now, rules) {
+  if (rules.overnight) {
+    const end = Number(rules.workEnd.slice(0, 2)) * 60 + Number(rules.workEnd.slice(3, 5));
+    if (now.getHours() * 60 + now.getMinutes() < end) return dayKey(new Date(now.getTime() - 24 * 3600 * 1000));
+  }
+  return dayKey(now);
+}
+
+// The record with a check-in that has no check-out yet (today's, or yesterday's for a shift that ran past midnight).
+// Only counts when it started within the last 16 hours, so a forgotten check-out from yesterday never blocks today.
+const MAX_OPEN_HOURS = 16;
+async function findOpenRecord(userId, now) {
+  const dates = [dayKey(now), dayKey(new Date(now.getTime() - 24 * 3600 * 1000))];
+  const recs = await Attendance.find({ user: userId, date: { $in: dates } });
+  for (const rec of recs.sort((a, b) => (a.date < b.date ? 1 : -1))) {
+    const open = openSession(normalize(rec));
+    if (open && now - open.in < MAX_OPEN_HOURS * 3600 * 1000) return rec;
+  }
+  return null;
 }
 
 // What the front end needs to know about THIS person's rules (no secrets)
@@ -38,6 +68,7 @@ router.get('/rules', async (req, res) => {
     res.json({
       locationRequired: !!rules.sites,
       workStart: rules.workStart,
+      workEnd: rules.workEnd,
       graceMinutes: rules.graceMinutes,
       shiftName: rules.shiftName,
       places: rules.sites ? rules.sites.map((s) => s.name) : [],
@@ -49,13 +80,16 @@ router.get('/rules', async (req, res) => {
 
 // Today's record for the logged-in user
 router.get('/today', async (req, res) => {
-  const record = await Attendance.findOne({ user: req.user._id, date: dayKey() });
-  res.json(record);
+  if (req.user.role === 'admin') return res.json(null);
+  // someone still on a night shift that began yesterday gets yesterday's record, so they can check out
+  const open = await findOpenRecord(req.user._id, new Date());
+  res.json(open || (await Attendance.findOne({ user: req.user._id, date: dayKey() })));
 });
 
 // Check in  (body: { note?, lat?, lng?, accuracy? })
 router.post('/check-in', async (req, res) => {
   try {
+    if (req.user.role === 'admin') return res.status(403).json({ message: 'Admin accounts do not check in or out' });
     const dev = await checkDevice(req.user, req.headers['x-device-id']);
     if (!dev.ok) return res.status(dev.status).json({ message: dev.message });
 
@@ -64,7 +98,8 @@ router.post('/check-in', async (req, res) => {
     if (!presence.ok) return res.status(presence.status).json({ message: presence.message });
 
     const now = new Date();
-    const date = dayKey(now);
+    if (await findOpenRecord(req.user._id, now)) return res.status(409).json({ message: 'You are already checked in. Check out first.' });
+    const date = attendanceDate(now, rules);
     // An admin may have pre-marked the day as leave/absent; the first check-in overrides it
     const record = normalize((await Attendance.findOne({ user: req.user._id, date })) || new Attendance({ user: req.user._id, date }));
 
@@ -91,6 +126,7 @@ router.post('/check-in', async (req, res) => {
 // Check out
 router.post('/check-out', async (req, res) => {
   try {
+    if (req.user.role === 'admin') return res.status(403).json({ message: 'Admin accounts do not check in or out' });
     const dev = await checkDevice(req.user, req.headers['x-device-id']);
     if (!dev.ok) return res.status(dev.status).json({ message: dev.message });
 
@@ -99,7 +135,7 @@ router.post('/check-out', async (req, res) => {
     if (!presence.ok) return res.status(presence.status).json({ message: presence.message });
 
     const now = new Date();
-    const found = await Attendance.findOne({ user: req.user._id, date: dayKey(now) });
+    const found = (await findOpenRecord(req.user._id, now)) || (await Attendance.findOne({ user: req.user._id, date: dayKey(now) }));
     if (!found?.checkIn) return res.status(400).json({ message: 'You have not checked in today' });
     const record = normalize(found);
 
@@ -136,7 +172,9 @@ router.get('/', adminOnly, async (req, res) => {
   const filter = {};
   if (date) filter.date = date;
   else if (from || to) filter.date = { ...(from && { $gte: from }), ...(to && { $lte: to }) };
-  if (userId) filter.user = userId;
+  // only employees: records an admin account made earlier are not part of attendance
+  const staffIds = (await User.find({ role: 'staff' }).select('_id')).map((u) => u._id);
+  filter.user = userId ? userId : { $in: staffIds };
   if (status) filter.status = status;
 
   const records = await Attendance.find(filter)
@@ -198,7 +236,8 @@ async function loadReportRows(query) {
     const ids = (await User.find(who).select('_id')).map((u) => String(u._id));
     userIds = userIds ? userIds.filter((id) => ids.includes(id)) : ids;
   }
-  if (userIds) filter.user = { $in: userIds };
+  if (!userIds) userIds = (await User.find({ role: 'staff' }).select('_id')).map((u) => String(u._id)); // employees only
+  filter.user = { $in: userIds };
 
   const statuses = String(query.status || '').split(',').map((x) => x.trim()).filter((x) => STATUSES.includes(x));
   if (statuses.length) filter.status = { $in: statuses };
