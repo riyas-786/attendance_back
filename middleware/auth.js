@@ -11,6 +11,13 @@ exports.protect = async (req, res, next) => {
     const user = await User.findById(payload.id).select('+deviceId');
     if (!user || !user.active) return res.status(401).json({ message: 'Account not available' });
 
+    // Owners are view-only: they may read their own profile and the attendance-status overview, nothing else
+    if (user.role === 'owner') {
+      const p = req.baseUrl + req.path;
+      const allowed = req.method === 'GET' && (p === '/api/auth/me' || p === '/api/attendance/owner');
+      if (!allowed) return res.status(403).json({ message: 'Owner accounts can only view attendance status' });
+    }
+
     req.user = user;
     next();
   } catch (err) {

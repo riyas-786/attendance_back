@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { protect } = require('../middleware/auth');
 const { checkDevice } = require('../utils/device');
+const { getSettings } = require('../utils/settings');
 
 const router = express.Router();
 
@@ -32,12 +33,19 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '8h',
     });
-    res.json({ token, user: publicUser(user) });
+    res.json({ token, user: publicUser(user), timezone: (await getSettings()).timezone });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-router.get('/me', protect, (req, res) => res.json(publicUser(req.user)));
+// The company time zone comes with the profile so every screen shows times in it
+router.get('/me', protect, async (req, res) => {
+  try {
+    res.json({ ...publicUser(req.user), timezone: (await getSettings()).timezone });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 module.exports = router;

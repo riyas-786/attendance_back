@@ -26,6 +26,15 @@ function salaryFields(body) {
     if (!Number.isFinite(n) || n < 0) return { error: 'Salary or rate must be a number of 0 or more' };
     out.baseSalary = n;
   }
+  if (body.company !== undefined) {
+    const c = String(body.company || '').trim();
+    if (c.length > 60) return { error: 'Company name can be at most 60 characters' };
+    out.company = c;
+  }
+  if (body.salaryMode !== undefined) {
+    if (!['bank', 'cash'].includes(body.salaryMode)) return { error: 'Salary must be paid by bank or cash' };
+    out.salaryMode = body.salaryMode;
+  }
   if (body.joinDate !== undefined) {
     if (body.joinDate && !DATE_RE.test(body.joinDate)) return { error: 'Join date must be YYYY-MM-DD' };
     out.joinDate = body.joinDate || '';

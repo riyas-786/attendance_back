@@ -20,7 +20,13 @@ router.use(protect);
 
 const pad = (n) => String(n).padStart(2, '0');
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const timeStr = (d) => (d ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : '');
+// 24-hour "17:30" by default, or 12-hour "5:30 PM" when h12 is true (reports: ?timeFormat=12)
+const timeStr = (d, h12 = false) => {
+  if (!d) return '';
+  if (!h12) return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getHours() % 12 || 12}:${pad(d.getMinutes())} ${d.getHours() < 12 ? 'AM' : 'PM'}`;
+};
+const wants12h = (req) => String(req.query.timeFormat || '') === '12';
 const hoursStr = (mins) => (mins ? (mins / 60).toFixed(2) : '');
 
 // `rules` comes from resolveRules(): this person's own duty time
@@ -184,6 +190,40 @@ router.get('/', adminOnly, async (req, res) => {
   res.json(records);
 });
 
+// Owner view (read-only; also open to admins): who is in, late, on leave or not in on one day.
+// Deliberately minimal: names, status, times and hours only. No places, notes, emails or pay.
+router.get('/owner', async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin') return res.status(403).json({ message: 'Owner access required' });
+    const date = req.query.date || dayKey();
+    if (!isRealDate(date)) return res.status(400).json({ message: 'Date must be YYYY-MM-DD' });
+
+    const staff = await User.find({ role: 'staff', active: true }).select('name department').sort({ name: 1 });
+    const records = await Attendance.find({ date, user: { $in: staff.map((u) => u._id) } });
+    const byUser = new Map(records.map((r) => [String(r.user), r]));
+
+    const people = staff.map((u) => {
+      const r = byUser.get(String(u._id));
+      return {
+        id: String(u._id),
+        name: u.name,
+        department: u.department || '',
+        status: r ? r.status : 'not in',
+        sessions: r ? listSessions(r).map((s) => ({ in: s.in, out: s.out || null })) : [],
+        workedMinutes: r?.workedMinutes || 0,
+      };
+    });
+    const count = (s) => people.filter((p) => p.status === s).length;
+    res.json({
+      date,
+      counts: { total: people.length, present: count('present'), late: count('late'), leave: count('leave'), absent: count('absent'), notIn: count('not in') },
+      people,
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Daily summary: present / late / on leave / not yet in
 router.get('/summary', adminOnly, async (req, res) => {
   const date = req.query.date || dayKey();
@@ -285,7 +325,7 @@ const csvCell = (v) => {
 };
 
 // "08:00-12:00; 13:00-17:30" (a session still open shows "13:00-")
-const sessionsText = (r) => listSessions(r).map((s) => `${timeStr(s.in)}-${timeStr(s.out)}`).join('; ');
+const sessionsText = (r, h12 = false) => listSessions(r).map((s) => `${timeStr(s.in, h12)}-${timeStr(s.out, h12)}`).join('; ');
 
 // Check in = first check-in of the day, Check out = last check-out, Hours = total over all sessions
 // Where each session started/ended: "In: Head office (35 m) / Out: Head office (12 m); In: ..."
@@ -295,15 +335,15 @@ const placesText = (r) =>
     .join('; ');
 
 const COLUMNS = ['Date', 'Employee ID', 'Name', 'Department', 'Check in', 'Check out', 'Hours', 'All sessions', 'Places', 'Status', 'Leave type', 'Method', 'Note'];
-const toRow = (r) => [
+const toRow = (r, h12 = false) => [
   r.date,
   r.user?.employeeId || '',
   r.user?.name || '',
   r.user?.department || '',
-  timeStr(r.checkIn),
-  timeStr(r.checkOut),
+  timeStr(r.checkIn, h12),
+  timeStr(r.checkOut, h12),
   hoursStr(r.workedMinutes),
-  sessionsText(r),
+  sessionsText(r, h12),
   placesText(r),
   r.status,
   r.status === 'leave' ? (r.leaveType === 'unpaid' ? 'Unpaid' : 'Paid') + (r.leaveType && r.leaveType !== 'unpaid' ? ` (${r.leaveType})` : '') : '',
@@ -314,7 +354,7 @@ const toRow = (r) => [
 router.get('/export.csv', adminOnly, async (req, res) => {
   try {
     const { from, to, records } = await loadReportRows(req.query);
-    const lines = [COLUMNS, ...records.map(toRow)].map((row) => row.map(csvCell).join(','));
+    const lines = [COLUMNS, ...records.map((r) => toRow(r, wants12h(req)))].map((row) => row.map(csvCell).join(','));
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="attendance_${from}_to_${to}.csv"`);
     // BOM so Excel opens UTF-8 (Arabic names etc.) correctly
@@ -336,7 +376,7 @@ router.get('/report', adminOnly, async (req, res) => {
       if (counts[r.status] !== undefined) counts[r.status] += 1;
       minutes += r.workedMinutes || 0;
     }
-    res.json({ from, to, total: records.length, counts, hours: Number((minutes / 60).toFixed(2)), columns: COLUMNS, rows: records.slice(0, LIMIT).map(toRow), limit: LIMIT });
+    res.json({ from, to, total: records.length, counts, hours: Number((minutes / 60).toFixed(2)), columns: COLUMNS, rows: records.slice(0, LIMIT).map((r) => toRow(r, wants12h(req))), limit: LIMIT });
   } catch (err) {
     if (err instanceof BadFilter) return res.status(400).json({ message: err.message });
     res.status(500).json({ message: 'Could not build report' });
@@ -350,7 +390,7 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
 
     const sheet = wb.addWorksheet('Attendance');
     sheet.addRow(COLUMNS);
-    records.forEach((r) => sheet.addRow(toRow(r)));
+    records.forEach((r) => sheet.addRow(toRow(r, wants12h(req))));
     sheet.getRow(1).font = { bold: true };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE9EEFF' } };
     sheet.views = [{ state: 'frozen', ySplit: 1 }];
@@ -399,8 +439,8 @@ router.get('/export.xlsx', adminOnly, async (req, res) => {
         const b = s.out ? s.outLocation : undefined;
         loc.addRow([
           r.date, r.user?.employeeId || '', r.user?.name || '', i + 1,
-          timeStr(s.in), placeText(a, s.inMethod), cell(a?.distanceM), cell(a?.lat), cell(a?.lng), cell(a?.accuracy), link(a),
-          timeStr(s.out), s.out ? placeText(b, s.inMethod) : '', cell(b?.distanceM), cell(b?.lat), cell(b?.lng), cell(b?.accuracy), link(b),
+          timeStr(s.in, wants12h(req)), placeText(a, s.inMethod), cell(a?.distanceM), cell(a?.lat), cell(a?.lng), cell(a?.accuracy), link(a),
+          timeStr(s.out, wants12h(req)), s.out ? placeText(b, s.inMethod) : '', cell(b?.distanceM), cell(b?.lat), cell(b?.lng), cell(b?.accuracy), link(b),
         ]);
       });
     }

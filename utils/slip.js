@@ -92,10 +92,10 @@ function drawSlip(ws, ctx) {
   gap(10);
 
   // ---- employee
-  const rate = row.payType === 'monthly' ? `${fmt(row.rate)} per month${row.payMethod === 'days' ? ' (by days present)' : ' (fixed)'}` : row.payType === 'daily' ? `${fmt(row.rate)} per day` : `${fmt(row.rate)} per hour`;
+  const rate = fmt(row.rate); // just the amount (the Pay type beside it already says monthly / daily / hourly)
   const info = [
     [['Employee', row.name], ['Pay type', { monthly: 'Monthly', daily: 'Daily', hourly: 'Hourly' }[row.payType]]],
-    [['Employee ID', row.employeeId || '-'], ['Rate', `${currency} ${rate}`]],
+    [['Employee ID', row.employeeId || '-'], ['Basic salary', rate]],
     [['Department', row.department || '-'], ['Joined', ctx.joinDate ? dFull(ctx.joinDate) : '-']],
   ];
   info.forEach(([a, b], i) => {

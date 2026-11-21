@@ -32,6 +32,12 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
     console.log('MongoDB connected');
+    // the admin may have chosen a different company time zone on the Settings page
+    try {
+      const { getSettings, applyTimezone } = require('./utils/settings');
+      applyTimezone((await getSettings()).timezone);
+    } catch (e) { console.error('Could not load the saved time zone:', e.message); }
+    console.log('Company time zone:', process.env.TZ);
     app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
   })
   .catch((err) => {

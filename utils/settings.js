@@ -20,6 +20,7 @@ const ENV = {
   payrollStartDay: 'PAYROLL_START_DAY',
   payHoursPerDay: 'PAY_HOURS_PER_DAY',
   monthlyMethod: 'MONTHLY_METHOD',
+  timezone: 'TIMEZONE',
 };
 
 const num = (v, fallback) => {
@@ -49,6 +50,7 @@ function envDefaults() {
     payrollStartDay: num(e.PAYROLL_START_DAY, 1),
     payHoursPerDay: num(e.PAY_HOURS_PER_DAY, 8),
     monthlyMethod: e.MONTHLY_METHOD === 'days' ? 'days' : 'fixed',
+    timezone: e.TIMEZONE || 'Asia/Dubai',
   };
 }
 
@@ -139,7 +141,21 @@ function validate(input = {}, base = envDefaults()) {
     if (!['fixed', 'days'].includes(input.monthlyMethod)) return { error: 'Monthly pay method must be fixed or days' };
     v.monthlyMethod = input.monthlyMethod;
   }
+  if (has('timezone')) {
+    const tz = String(input.timezone).trim();
+    try { new Intl.DateTimeFormat('en', { timeZone: tz }); }
+    catch { return { error: 'Unknown time zone. Use a name like Asia/Kolkata or Asia/Dubai' }; }
+    // keep the name the admin picked (Intl would rewrite Asia/Kolkata to the old alias Asia/Calcutta), only fixing the letter case
+    const known = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+    v.timezone = known.find((z) => z.toLowerCase() === tz.toLowerCase()) || tz;
+  }
   return { values: v };
+}
+
+// The server keeps every day, duty time and late check in the company time zone by running in it.
+// Changing process.env.TZ takes effect straight away (no restart).
+function applyTimezone(tz) {
+  if (tz && process.env.TZ !== tz) process.env.TZ = tz;
 }
 
 // ---- database ----
@@ -164,7 +180,8 @@ async function saveSettings(input) {
     { $set: { key: 'main', ...values } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
+  applyTimezone(values.timezone);
   return { values };
 }
 
-module.exports = { getSettings, saveSettings, validate, envDefaults };
+module.exports = { getSettings, saveSettings, validate, envDefaults, applyTimezone };

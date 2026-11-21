@@ -6,7 +6,7 @@ const userSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true, minlength: 6, select: false },
-    role: { type: String, enum: ['admin', 'staff'], default: 'staff' },
+    role: { type: String, enum: ['admin', 'staff', 'owner'], default: 'staff' },
     department: { type: String, trim: true, default: '' },
     employeeId: { type: String, trim: true, unique: true, sparse: true },
     active: { type: Boolean, default: true },
@@ -16,6 +16,10 @@ const userSchema = new mongoose.Schema(
     payType: { type: String, enum: ['monthly', 'daily', 'hourly'], default: 'monthly' },
     // The amount for payType: monthly salary / rate per day / rate per hour
     baseSalary: { type: Number, min: 0, default: 0 },
+    // Which business pays this person (e.g. TP Group, B Bells) and whether the salary balance goes out as cash or by bank.
+    // Used by the Salary summary page.
+    company: { type: String, trim: true, maxlength: 60, default: '' },
+    salaryMode: { type: String, enum: ['bank', 'cash'], default: 'bank' },
     // YYYY-MM-DD. Days before this are not counted as absences. Leave empty to count the whole month.
     joinDate: { type: String, default: '' },
     // Duty time. Empty = use the default work start / grace from Settings.

@@ -19,6 +19,7 @@ const settingsSchema = new mongoose.Schema(
     payrollStartDay: Number,
     payHoursPerDay: Number,
     monthlyMethod: String,
+    timezone: String,
   },
   { timestamps: true, minimize: false }
 );

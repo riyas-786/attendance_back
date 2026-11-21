@@ -7,6 +7,7 @@ const User = require('./models/User');
 
   const users = [
     { name: 'Admin', email: 'admin@company.com', password: 'Admin@123', role: 'admin', employeeId: 'E001', department: 'HR' },
+    { name: 'Owner', email: 'owner@company.com', password: 'Owner@123', role: 'owner', employeeId: 'E000', department: 'Management' },
     { name: 'Sara Ahmed', email: 'sara@company.com', password: 'Staff@123', role: 'staff', employeeId: 'E002', department: 'Sales', baseSalary: 8000 },
     { name: 'Omar Khan', email: 'omar@company.com', password: 'Staff@123', role: 'staff', employeeId: 'E003', department: 'IT', baseSalary: 9000 },
   ];
