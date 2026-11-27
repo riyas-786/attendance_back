@@ -1,7 +1,7 @@
 const express = require('express');
 const Leave = require('../models/Leave');
 const Attendance = require('../models/Attendance');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, allow } = require('../middleware/auth');
 
 const router = express.Router();
 router.use(protect);
@@ -67,7 +67,7 @@ router.put('/:id/cancel', async (req, res) => {
 });
 
 // Admin: list requests (?status=pending)
-router.get('/', adminOnly, async (req, res) => {
+router.get('/', allow('leaves'), async (req, res) => {
   const filter = req.query.status ? { status: req.query.status } : {};
   const leaves = await Leave.find(filter)
     .populate('user', 'name email department employeeId')
@@ -78,7 +78,7 @@ router.get('/', adminOnly, async (req, res) => {
 });
 
 // Admin: approve or reject  (body: { decision: 'approved' | 'rejected', note? })
-router.put('/:id/review', adminOnly, async (req, res) => {
+router.put('/:id/review', allow('leaves'), async (req, res) => {
   try {
     const { decision, note } = req.body;
     if (!['approved', 'rejected'].includes(decision)) {
@@ -98,8 +98,9 @@ router.put('/:id/review', adminOnly, async (req, res) => {
     if (decision === 'approved') {
       for (const date of datesBetween(leave.from, leave.to)) {
         const existing = await Attendance.findOne({ user: leave.user, date });
-        if (existing?.checkIn) continue;
+        if (existing?.checkIn && !existing.auto) continue; // a real check-in stays; a day the system filled in for an auto-attendance person becomes leave
         const rec = existing || new Attendance({ user: leave.user, date });
+        if (rec.auto) { rec.sessions = []; rec.checkIn = undefined; rec.checkOut = undefined; rec.workedMinutes = 0; rec.auto = false; }
         rec.status = 'leave';
         rec.leaveType = leave.type;
         rec.note = `Approved ${leave.type} leave`;

@@ -20,6 +20,12 @@ const ENV = {
   payrollStartDay: 'PAYROLL_START_DAY',
   payHoursPerDay: 'PAY_HOURS_PER_DAY',
   monthlyMethod: 'MONTHLY_METHOD',
+  timezone: 'TIMEZONE',
+  halfDayEnabled: 'HALF_DAY_ENABLED',
+  holidayOtMultiplier: 'HOLIDAY_OT_MULTIPLIER',
+  autoCheckoutEnabled: 'AUTO_CHECKOUT_ENABLED',
+  autoCheckoutTime: 'AUTO_CHECKOUT_TIME',
+  autoCheckoutHours: 'AUTO_CHECKOUT_HOURS',
 };
 
 const num = (v, fallback) => {
@@ -49,6 +55,13 @@ function envDefaults() {
     payrollStartDay: num(e.PAYROLL_START_DAY, 1),
     payHoursPerDay: num(e.PAY_HOURS_PER_DAY, 8),
     monthlyMethod: e.MONTHLY_METHOD === 'days' ? 'days' : 'fixed',
+    timezone: e.TIMEZONE || 'Asia/Dubai',
+    holidayOtMultiplier: num(e.HOLIDAY_OT_MULTIPLIER, 1), // pay for accepted weekend / holiday attendance: x a normal day
+    // forgotten check-outs are closed automatically (on by default)
+    autoCheckoutEnabled: e.AUTO_CHECKOUT_ENABLED !== 'false',
+    autoCheckoutTime: e.AUTO_CHECKOUT_TIME || '23:30', // after this time (company time) a check-in that is still open is closed
+    autoCheckoutHours: num(e.AUTO_CHECKOUT_HOURS, 9), // closed after this many hours when the person has no shift end
+    halfDayEnabled: e.HALF_DAY_ENABLED !== 'false', // half-day leave / absence can be marked (on by default)
   };
 }
 
@@ -139,7 +152,37 @@ function validate(input = {}, base = envDefaults()) {
     if (!['fixed', 'days'].includes(input.monthlyMethod)) return { error: 'Monthly pay method must be fixed or days' };
     v.monthlyMethod = input.monthlyMethod;
   }
+  if (has('holidayOtMultiplier')) {
+    const n = Number(input.holidayOtMultiplier);
+    if (!isNum(n) || n < 0.1 || n > 10) return { error: 'Holiday OT rate must be between 0.1 and 10 (1 = a normal day, 1.5 = time and a half)' };
+    v.holidayOtMultiplier = n;
+  }
+  if (has('autoCheckoutEnabled')) v.autoCheckoutEnabled = input.autoCheckoutEnabled === true || input.autoCheckoutEnabled === 'true';
+  if (has('autoCheckoutTime')) {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(input.autoCheckoutTime))) return { error: 'Automatic check-out time must be HH:MM (24-hour)' };
+    v.autoCheckoutTime = String(input.autoCheckoutTime);
+  }
+  if (has('autoCheckoutHours')) {
+    const n = Number(input.autoCheckoutHours);
+    if (!isNum(n) || n < 1 || n > 24) return { error: 'Hours for an automatic check-out must be between 1 and 24' };
+    v.autoCheckoutHours = n;
+  }
+  if (has('halfDayEnabled')) v.halfDayEnabled = input.halfDayEnabled === true || input.halfDayEnabled === 'true';
+  if (has('timezone')) {
+    const tz = String(input.timezone).trim();
+    try { new Intl.DateTimeFormat('en', { timeZone: tz }); }
+    catch { return { error: 'Unknown time zone. Use a name like Asia/Kolkata or Asia/Dubai' }; }
+    // keep the name the admin picked (Intl would rewrite Asia/Kolkata to the old alias Asia/Calcutta), only fixing the letter case
+    const known = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+    v.timezone = known.find((z) => z.toLowerCase() === tz.toLowerCase()) || tz;
+  }
   return { values: v };
+}
+
+// The server keeps every day, duty time and late check in the company time zone by running in it.
+// Changing process.env.TZ takes effect straight away (no restart).
+function applyTimezone(tz) {
+  if (tz && process.env.TZ !== tz) process.env.TZ = tz;
 }
 
 // ---- database ----
@@ -164,7 +207,8 @@ async function saveSettings(input) {
     { $set: { key: 'main', ...values } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
+  applyTimezone(values.timezone);
   return { values };
 }
 
-module.exports = { getSettings, saveSettings, validate, envDefaults };
+module.exports = { getSettings, saveSettings, validate, envDefaults, applyTimezone };

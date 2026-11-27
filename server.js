@@ -32,6 +32,24 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
     console.log('MongoDB connected');
+    // the admin may have chosen a different company time zone on the Settings page
+    try {
+      const { getSettings, applyTimezone } = require('./utils/settings');
+      applyTimezone((await getSettings()).timezone);
+    } catch (e) { console.error('Could not load the saved time zone:', e.message); }
+    console.log('Company time zone:', process.env.TZ);
+
+    // forgotten check-outs are closed automatically (Settings -> Forgotten check-outs); checked every 10 minutes
+    const { sweep } = require('./utils/autoCheckout');
+    const runSweep = () => sweep().then((n) => { if (n) console.log(`Auto check-out: closed ${n} forgotten check-in(s)`); }).catch((e) => console.error('Auto check-out failed:', e.message));
+    runSweep();
+    setInterval(runSweep, 10 * 60 * 1000);
+
+    // people marked "Auto attendance" (no smartphone) are recorded present for their shift; checked every 10 minutes
+    const autoAtt = require('./utils/autoAttendance');
+    const runAuto = () => autoAtt.sweep().then((n) => { if (n) console.log(`Auto attendance: updated ${n} record(s)`); }).catch((e) => console.error('Auto attendance failed:', e.message));
+    runAuto();
+    setInterval(runAuto, 10 * 60 * 1000);
     app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
   })
   .catch((err) => {

@@ -2,10 +2,10 @@ const express = require('express');
 const mongoose = require('mongoose');
 const Location = require('../models/Location');
 const User = require('../models/User');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, adminOnly, anyPermission } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(protect, adminOnly);
+router.use(protect);
 
 function clean(body) {
   const name = String(body.name || '').trim();
@@ -23,7 +23,7 @@ function clean(body) {
 }
 
 // Locations with how many staff use each
-router.get('/', async (req, res) => {
+router.get('/', anyPermission, async (req, res) => {
   const [locations, counts] = await Promise.all([
     Location.find().sort({ name: 1 }).lean(),
     User.aggregate([{ $unwind: '$locations' }, { $group: { _id: '$locations', n: { $sum: 1 } } }]),
@@ -32,7 +32,7 @@ router.get('/', async (req, res) => {
   res.json(locations.map((l) => ({ ...l, staffCount: byId.get(String(l._id)) || 0 })));
 });
 
-router.post('/', async (req, res) => {
+router.post('/', adminOnly, async (req, res) => {
   try {
     const { value, error } = clean(req.body);
     if (error) return res.status(400).json({ message: error });
@@ -43,7 +43,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.put('/:id', async (req, res) => {
+router.put('/:id', adminOnly, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Location not found' });
     const { value, error } = clean(req.body);
@@ -58,7 +58,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // Deleting removes it from every staff member who had it
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', adminOnly, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Location not found' });
   const loc = await Location.findByIdAndDelete(req.params.id);
   if (!loc) return res.status(404).json({ message: 'Location not found' });

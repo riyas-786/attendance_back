@@ -4,14 +4,16 @@ const ExcelJS = require('exceljs');
 const User = require('../models/User');
 const Attendance = require('../models/Attendance');
 const Adjustment = require('../models/Adjustment');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, allow } = require('../middleware/auth');
 const { computePayroll } = require('../utils/payroll');
 const { getSettings } = require('../utils/settings');
-const { resolvePeriod, datesBetween } = require('../utils/period');
-const { workingDaysIn, payrollCfg } = require('../utils/payroll');
+const { resolvePeriod, datesBetween, isPeriodKey } = require('../utils/period');
+const SalaryFunds = require('../models/SalaryFunds');
+const { summarise } = require('../utils/salarySummary');
+const { workingDaysIn, payrollCfg, isOtCandidate, otPay } = require('../utils/payroll');
 
 const router = express.Router();
-router.use(protect, adminOnly);
+router.use(protect);
 
 const pad = (n) => String(n).padStart(2, '0');
 const todayKey = () => {
@@ -80,7 +82,243 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-router.get('/', async (req, res) => {
+
+// ---- Salary summary: earned, advances, balance, cash vs bank, and how much more money is needed ----
+async function buildSummary(query) {
+  const { data, error, period } = await build(query);
+  if (error) return { error };
+  const users = await User.find({ _id: { $in: data.rows.map((r) => r.userId) } }).select('company salaryMode');
+  const funds = (await SalaryFunds.findOne({ key: period.key })) || { cash: 0, bank: 0 };
+  return {
+    summary: {
+      company: process.env.COMPANY_NAME || 'TEE PEE Group',
+      currency: data.currency,
+      period: { key: period.key, month: data.month, from: data.from, to: data.to, custom: !!data.custom, inProgress: data.inProgress },
+      ...summarise(data, users, funds),
+    },
+  };
+}
+
+router.get('/summary', allow('salary_summary'), async (req, res) => {
+  try {
+    const { summary, error } = await buildSummary(req.query);
+    if (error) return res.status(400).json({ message: error });
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ message: 'Could not build the salary summary' });
+  }
+});
+
+// Attendance on weekends / holidays in this period, with what the admin decided and what accepting it would pay
+router.get('/holiday-attendance', allow('payroll_view'), async (req, res) => {
+  try {
+    const { data, records, cfg, period, error } = await build(req.query);
+    if (error) return res.status(400).json({ message: error });
+    const pc = payrollCfg(cfg);
+    const wd = new Set(workingDaysIn(period.from, period.to, pc));
+    const users = await User.find({ _id: { $in: data.rows.map((r) => r.userId) } }).select('joinDate');
+    const byUser = new Map(data.rows.map((r) => [String(r.userId), r]));
+    const joined = new Map(users.map((u) => [String(u._id), u.joinDate]));
+    const items = [];
+    for (const rec of records) {
+      const row = byUser.get(String(rec.user));
+      if (!row || !isOtCandidate(rec, rec.date, wd, { joinDate: joined.get(String(rec.user)) }, period)) continue;
+      const percent = rec.otStatus === 'accepted' && Number(rec.otPercent) >= 1 ? Number(rec.otPercent) : 100;
+      items.push({
+        userId: row.userId, name: row.name, employeeId: row.employeeId, payType: row.payType, date: rec.date,
+        hours: Math.round(((Number(rec.workedMinutes) || 0) / 60) * 100) / 100,
+        status: rec.otStatus === 'accepted' ? 'accepted' : rec.otStatus === 'rejected' ? 'rejected' : 'pending',
+        percent,
+        amount: otPay({ payType: row.payType, rate: row.rate, dailyRate: row.dailyRate }, rec, pc.otMultiplier), // accepted: what it pays; waiting: what 100% would pay
+        multiplier: pc.otMultiplier,
+      });
+    }
+    items.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
+    res.json({ currency: data.currency, items });
+  } catch (err) {
+    res.status(500).json({ message: 'Could not load weekend / holiday attendance' });
+  }
+});
+
+// Money available for this period's salaries (typed in by the admin)
+router.put('/funds', allow('salary_summary'), async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (typeof key !== 'string' || !isPeriodKey(key)) return res.status(400).json({ message: 'Invalid pay period' });
+    const num = (v) => (v === '' || v === null || v === undefined ? 0 : Number(v));
+    const cash = num(req.body.cash);
+    const bank = num(req.body.bank);
+    for (const n of [cash, bank]) {
+      if (!Number.isFinite(n) || n < 0 || n > 1e10) return res.status(400).json({ message: 'Amounts must be 0 or more' });
+    }
+    const doc = await SalaryFunds.findOneAndUpdate({ key }, { key, cash, bank, updatedBy: req.user._id }, { upsert: true, new: true, setDefaultsOnInsert: true });
+    res.json({ key: doc.key, cash: doc.cash, bank: doc.bank });
+  } catch (err) {
+    res.status(500).json({ message: 'Could not save the amounts' });
+  }
+});
+
+router.get('/summary.xlsx', allow('salary_summary'), async (req, res) => {
+  try {
+    const { summary: s, error } = await buildSummary(req.query);
+    if (error) return res.status(400).json({ message: error });
+    const cur = s.currency;
+    const money = `#,##0.00`;
+    const FONT = 'Calibri';
+    const fill = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+    const thin = { style: 'thin', color: { argb: 'FFD9DDE3' } };
+    const box = { top: thin, left: thin, bottom: thin, right: thin };
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Summary', { views: [{ showGridLines: false }] });
+    [3, 34, 16, 18, 18, 18, 3].forEach((w, i) => (ws.getColumn(i + 1).width = w));
+    let r = 1;
+    const style = (row, o) => { for (let c = 2; c <= 6; c++) Object.assign(row.getCell(c), o); };
+
+    // title
+    ws.mergeCells(`B${r}:F${r}`);
+    ws.getCell(`B${r}`).value = 'SALARY SUMMARY';
+    ws.getCell(`B${r}`).font = { name: FONT, size: 20, bold: true, color: { argb: 'FFFFFFFF' } };
+    ws.getCell(`B${r}`).alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+    style(ws.getRow(r), { fill: fill('FF1F2937') });
+    ws.getRow(r).height = 36;
+    r++;
+    ws.mergeCells(`B${r}:F${r}`);
+    ws.getCell(`B${r}`).value = `${s.company}  ·  ${s.period.custom ? s.period.from + ' to ' + s.period.to : s.period.month}  (${s.period.from} to ${s.period.to})  ·  Amounts in ${cur}${s.period.inProgress ? '  ·  period still running: figures are so far' : ''}`;
+    ws.getCell(`B${r}`).font = { name: FONT, size: 11, color: { argb: 'FF374151' } };
+    ws.getCell(`B${r}`).alignment = { indent: 1, vertical: 'middle' };
+    style(ws.getRow(r), { fill: fill('FFF3F4F6') });
+    ws.getRow(r).height = 22;
+    r += 2;
+
+    const section = (text, color) => {
+      ws.mergeCells(`B${r}:F${r}`);
+      const c = ws.getCell(`B${r}`);
+      c.value = text;
+      c.font = { name: FONT, size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
+      c.alignment = { indent: 1, vertical: 'middle' };
+      style(ws.getRow(r), { fill: fill(color) });
+      ws.getRow(r).height = 24;
+      r++;
+    };
+    const head = (labels) => {
+      labels.forEach((t, i) => {
+        const c = ws.getCell(r, 2 + i);
+        c.value = t;
+        c.font = { name: FONT, bold: true, color: { argb: 'FF374151' } };
+        c.fill = fill('FFE5E7EB');
+        c.border = box;
+        c.alignment = { horizontal: i === 0 ? 'left' : 'right', vertical: 'middle', indent: i === 0 ? 1 : 0 };
+      });
+      ws.getRow(r).height = 22;
+      r++;
+    };
+    const line = (label, vals, opt = {}) => {
+      const row = ws.getRow(r);
+      row.getCell(2).value = label;
+      vals.forEach((v, i) => { row.getCell(3 + i).value = v; });
+      for (let c = 2; c <= 2 + vals.length; c++) {
+        const cell = row.getCell(c);
+        cell.font = { name: FONT, size: 11, bold: !!opt.bold, color: { argb: opt.color || 'FF111827' } };
+        cell.border = box;
+        if (opt.fill) cell.fill = fill(opt.fill);
+        if (c > 2) { cell.alignment = { horizontal: 'right', vertical: 'middle' }; cell.numFmt = opt.fmts ? opt.fmts[c - 3] : money; }
+        else cell.alignment = { indent: 1, vertical: 'middle' };
+      }
+      row.height = 22;
+      r++;
+      return r - 1;
+    };
+
+    // 1. salary, advance, balance
+    section('1.  SALARY, ADVANCE AND BALANCE', 'FF2563EB');
+    head(['', `Amount (${cur})`]);
+    const rEarned = line('Total salary for the period', [s.totals.earned], { bold: true });
+    const rAdv = line('Advance already paid', [s.totals.advance], { color: 'FFB91C1C' });
+    let rOther = null;
+    if (s.totals.otherDeductions > 0) rOther = line('Other deductions (fines, loans)', [s.totals.otherDeductions], { color: 'FFB91C1C' });
+    const rBal = line('Balance salary to pay', [{ formula: `C${rEarned}-C${rAdv}${rOther ? `-C${rOther}` : ''}`, result: s.totals.earned - s.totals.advance - s.totals.otherDeductions }], { bold: true, fill: 'FFDCFCE7', color: 'FF166534' });
+    r++;
+
+    // 2. cash vs bank
+    section('2.  HOW THE BALANCE IS PAID', 'FF0F766E');
+    head(['', 'Staff', `Amount (${cur})`]);
+    const rCash = line('Balance paid by CASH', [s.payBy.cash.staff, s.payBy.cash.amount], { fmts: ['0', money] });
+    const rBank = line('Balance paid by BANK', [s.payBy.bank.staff, s.payBy.bank.amount], { fmts: ['0', money] });
+    line('Total balance', [{ formula: `C${rCash}+C${rBank}`, result: s.payBy.cash.staff + s.payBy.bank.staff }, { formula: `D${rCash}+D${rBank}`, result: s.payBy.cash.amount + s.payBy.bank.amount }], { bold: true, fill: 'FFE5E7EB', fmts: ['0', money] });
+    r++;
+
+    // 3. funds needed
+    section('3.  MONEY READY vs MONEY NEEDED', 'FFB91C1C');
+    head(['', 'To pay', 'Available', 'Additional needed', 'Spare']);
+    const rFc = r;
+    line('CASH (in hand)', [s.payBy.cash.amount, s.funds.cash, { formula: `MAX(0,C${rFc}-D${rFc})`, result: s.need.cash }, { formula: `MAX(0,D${rFc}-C${rFc})`, result: s.spare.cash }]);
+    const rFb = r;
+    line('BANK (balance)', [s.payBy.bank.amount, s.funds.bank, { formula: `MAX(0,C${rFb}-D${rFb})`, result: s.need.bank }, { formula: `MAX(0,D${rFb}-C${rFb})`, result: s.spare.bank }]);
+    line('TOTAL', [0, 1, 2, 3].map((i) => { const col = 'CDEF'[i]; return { formula: `${col}${rFc}+${col}${rFb}`, result: [s.payBy.cash.amount + s.payBy.bank.amount, s.funds.cash + s.funds.bank, s.needTotal, s.spare.cash + s.spare.bank][i] }; }), { bold: true, fill: 'FFFEE2E2', color: 'FF991B1B' });
+    // "Available" is typed in by the admin: blue text, light yellow fill (change it here and the rest recalculates)
+    [rFc, rFb].forEach((x) => { const c = ws.getCell(x, 4); c.font = { name: FONT, size: 11, color: { argb: 'FF0000FF' } }; c.fill = fill('FFFFF9DB'); });
+    ws.mergeCells(`B${r}:F${r}`);
+    ws.getCell(`B${r}`).value = 'Blue cells are the money available (entered in the app). Change them here and "Additional needed" recalculates.';
+    ws.getCell(`B${r}`).font = { name: FONT, size: 9, italic: true, color: { argb: 'FF6B7280' } };
+    r += 2;
+
+    // 4. by company (only when companies are set)
+    if (s.byCompany.some((g) => g.company)) {
+      section('4.  BY COMPANY', 'FF7C3AED');
+      head(['Company', 'Staff', 'Total salary', 'Advance paid', 'Balance to pay']);
+      const first = r;
+      s.byCompany.forEach((g) => line(g.company || 'No company set', [g.staff, g.earned, g.advance, g.balance], { fmts: ['0', money, money, money] }));
+      const last = r - 1;
+      line('Total', ['C', 'D', 'E', 'F'].map((col, i) => ({ formula: `SUM(${col}${first}:${col}${last})`, result: [s.totals.staff, s.totals.earned, s.totals.advance, s.totals.balance][i] })), { bold: true, fill: 'FFE5E7EB', fmts: ['0', money, money, money] });
+    }
+    ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1, paperSize: 9, horizontalCentered: true };
+
+    // staff detail
+    const d = wb.addWorksheet('Staff detail', { views: [{ state: 'frozen', ySplit: 1 }] });
+    const cols = [['Employee ID', 13], ['Name', 24], ['Company', 18], ['Department', 16], [`Salary (${cur})`, 15], [`Advance paid (${cur})`, 18], [`Other deductions (${cur})`, 20], [`Balance to pay (${cur})`, 19], ['Paid by', 10]];
+    d.addRow(cols.map((c) => c[0]));
+    cols.forEach((c, i) => (d.getColumn(i + 1).width = c[1]));
+    s.rows.forEach((x) => d.addRow([x.employeeId, x.name, x.company, x.department, x.earned, x.advance, x.otherDeductions, x.balance, x.mode === 'cash' ? 'Cash' : 'Bank']));
+    const n = s.rows.length;
+    const tot = d.addRow(['', 'TOTAL', '', '', ...['E', 'F', 'G', 'H'].map((col, i) => ({ formula: `SUM(${col}2:${col}${n + 1})`, result: [s.totals.earned, s.totals.advance, s.totals.otherDeductions, s.totals.balance][i] })), '']);
+    d.getRow(1).eachCell((c) => { c.font = { name: FONT, bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = fill('FF1F2937'); c.alignment = { vertical: 'middle', wrapText: true }; });
+    d.getRow(1).height = 28;
+    tot.font = { name: FONT, bold: true };
+    tot.eachCell((c) => { c.fill = fill('FFE5E7EB'); });
+    for (let i = 2; i <= n + 2; i++) { [5, 6, 7, 8].forEach((c) => (d.getRow(i).getCell(c).numFmt = money)); if (i <= n + 1) d.getRow(i).getCell(9).alignment = { horizontal: 'center' }; }
+    d.pageSetup = { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9 };
+    d.pageSetup.printTitlesRow = '1:1';
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="salary_summary_${s.period.custom ? s.period.from + '_to_' + s.period.to : s.period.month}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    res.status(500).json({ message: 'Could not build the salary summary file' });
+  }
+});
+
+// A staff member's OWN salary for a pay month (nothing else: the server fixes the person to the signed-in user)
+router.get('/my', async (req, res) => {
+  try {
+    if (req.user.role !== 'staff') return res.status(403).json({ message: 'Only staff can view their own salary here' });
+    const month = typeof req.query.month === 'string' ? req.query.month : undefined; // only a pay month; no custom ranges or filters
+    const { data, error } = await build({ month, userId: String(req.user._id) });
+    if (error) return res.status(400).json({ message: error });
+    const row = data.rows[0];
+    if (!row) return res.status(404).json({ message: 'No salary details for this period' });
+    const { phone, ...mine } = row; // phone not needed
+    res.json({
+      month: data.month, from: data.from, to: data.to, currency: data.currency, inProgress: data.inProgress,
+      totalWorkingDays: data.totalWorkingDays, lateThreshold: data.lateThreshold, lateDays: data.lateDays, row: mine,
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Could not load your salary' });
+  }
+});
+
+router.get('/', allow('payroll_view'), async (req, res) => {
   try {
     const { data, error } = await build(req.query);
     if (error) return res.status(400).json({ message: error });
@@ -90,7 +328,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-router.get('/export.xlsx', async (req, res) => {
+router.get('/export.xlsx', allow('payroll_view'), async (req, res) => {
   try {
     const { data, error } = await build(req.query);
     if (error) return res.status(400).json({ message: error });
@@ -162,13 +400,13 @@ const periodTitle = (data) => {
   return `${MONTHS_LONG[Number(m) - 1]} ${y}`;
 };
 
-router.get('/slips.xlsx', async (req, res) => {
+router.get('/slips.xlsx', allow('payroll_view'), async (req, res) => {
   try {
     const { data, records, cfg, error } = await build(req.query);
     if (error) return res.status(400).json({ message: error });
     if (!data.rows.length) return res.status(404).json({ message: 'No employees match these filters' });
 
-    const company = process.env.COMPANY_NAME || 'Teepee Group';
+    const company = process.env.COMPANY_NAME || 'TEE PEE Group';
     const wcfg = payrollCfg(cfg);
     const allDays = datesBetween(data.from, data.to);
     const offDays = new Set(allDays.filter((d) => !workingDaysIn(d, d, wcfg).length));
@@ -186,13 +424,17 @@ router.get('/slips.xlsx', async (req, res) => {
     for (const row of data.rows) {
       const u = users.get(String(row.userId));
       const recs = byUser.get(String(row.userId)) || new Map();
-      // 1 = worked, L = paid leave, UL = unpaid leave, A = absent, Off = weekend / holiday, blank = not decided yet
+      // ½L / ½UL / ½A = half-day leave / unpaid leave / absence, 1 = worked, L = paid leave, UL = unpaid leave, A = absent, Off = weekend / holiday, blank = not decided yet
       const dayCells = allDays.map((d) => {
         const r = recs.get(d);
         let mark = '';
         if (u?.joinDate && d < u.joinDate) mark = '';
-        else if (r?.checkIn) mark = 1;
+        else if (r?.halfDay && r.status === 'leave') mark = r.leaveType === 'unpaid' ? '½UL' : '½L';
+        else if (r?.halfDay && r.status === 'absent') mark = '½A';
         else if (r?.status === 'leave') mark = r.leaveType === 'unpaid' ? 'UL' : 'L';
+        else if (r?.checkIn && r.status === 'absent') mark = 'A';
+        else if (r?.checkIn && offDays.has(d)) mark = r.otStatus === 'accepted' ? 'OT' : 'Off'; // weekend / holiday: shown as OT only once accepted
+        else if (r?.checkIn) mark = 1;
         else if (offDays.has(d)) mark = 'Off';
         else if (d < today) mark = 'A';
         return { date: d, mark };
@@ -216,7 +458,7 @@ router.get('/slips.xlsx', async (req, res) => {
   }
 });
 
-router.get('/export.csv', async (req, res) => {
+router.get('/export.csv', allow('payroll_view'), async (req, res) => {
   try {
     const { data, error } = await build(req.query);
     if (error) return res.status(400).json({ message: error });

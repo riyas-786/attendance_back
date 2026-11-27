@@ -19,6 +19,12 @@ const settingsSchema = new mongoose.Schema(
     payrollStartDay: Number,
     payHoursPerDay: Number,
     monthlyMethod: String,
+    timezone: String,
+    halfDayEnabled: Boolean,
+    holidayOtMultiplier: Number,
+    autoCheckoutEnabled: Boolean,
+    autoCheckoutTime: String,
+    autoCheckoutHours: Number,
   },
   { timestamps: true, minimize: false }
 );

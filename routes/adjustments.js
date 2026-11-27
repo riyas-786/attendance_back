@@ -2,16 +2,16 @@ const express = require('express');
 const mongoose = require('mongoose');
 const Adjustment = require('../models/Adjustment');
 const User = require('../models/User');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, allow } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(protect, adminOnly);
+router.use(protect);
 
 const { isPeriodKey, isRealDate } = require('../utils/period');
 const MONTH_RE = { test: (k) => isPeriodKey(String(k || '')) };
 
 // GET /api/adjustments?from=YYYY-MM-DD&to=YYYY-MM-DD[&user=id]   (or ?month=<pay period key> for older entries)
-router.get('/', async (req, res) => {
+router.get('/', allow('payroll_view', 'payroll_edit'), async (req, res) => {
   try {
     const { month, user, from, to } = req.query;
     let filter;
@@ -32,14 +32,16 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/adjustments  { user, date, type, label, amount, note }
-//   date  = the day it is for; label = what it is (Overtime, Advance ...); note = narration (required)
-router.post('/', async (req, res) => {
+// POST /api/adjustments  { user, date | month, type, label, amount, note }
+//   date  = the day it is for. Or send `month` (the pay period key, e.g. 2026-12) instead of a date for an amount
+//           that belongs to the whole month with no particular day; label = what it is (Overtime, Advance ...); note = narration (required)
+router.post('/', allow('payroll_edit'), async (req, res) => {
   try {
-    const { user, date, type, label, note } = req.body || {};
+    const { user, date, month, type, label, note } = req.body || {};
     const amount = Number(req.body?.amount);
     if (!mongoose.isValidObjectId(user)) return res.status(400).json({ message: 'Choose a staff member' });
-    if (!isRealDate(String(date || ''))) return res.status(400).json({ message: 'Choose the date (YYYY-MM-DD)' });
+    const byMonth = !date; // month-based: belongs to the whole pay month, not to one day
+    if (byMonth ? !MONTH_RE.test(month || '') : !isRealDate(String(date))) return res.status(400).json({ message: byMonth ? 'Choose the date or the pay month' : 'Choose the date (YYYY-MM-DD)' });
     if (!['earning', 'deduction'].includes(type)) return res.status(400).json({ message: 'Type must be earning or deduction' });
     if (!String(label || '').trim()) return res.status(400).json({ message: 'Enter a name, e.g. Overtime or Advance' });
     if (!String(note || '').trim()) return res.status(400).json({ message: 'Write a short narration, e.g. why this amount' });
@@ -49,7 +51,7 @@ router.post('/', async (req, res) => {
     if (!person) return res.status(404).json({ message: 'Staff member not found' });
 
     const doc = await Adjustment.create({
-      user, date, month: date.slice(0, 7), type, label: String(label).trim().slice(0, 60),
+      user, date: byMonth ? '' : date, month: byMonth ? month : date.slice(0, 7), type, label: String(label).trim().slice(0, 60),
       amount: Math.round(amount * 100) / 100, note: String(note).trim().slice(0, 300), createdBy: req.user._id,
     });
     res.status(201).json(doc);
@@ -58,7 +60,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', allow('payroll_edit'), async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid id' });
     const doc = await Adjustment.findByIdAndDelete(req.params.id);

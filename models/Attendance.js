@@ -12,7 +12,9 @@ const sessionSchema = new mongoose.Schema(
     out: { type: Date },
     inLocation: { type: pointSchema },
     outLocation: { type: pointSchema },
-    inMethod: { type: String, enum: ['button', 'qr', 'admin'], default: 'button' },
+    inMethod: { type: String, enum: ['button', 'qr', 'admin', 'auto'], default: 'button' },
+    // who closed it when it was not the person: 'auto' = closed by the system (forgotten check-out), 'admin' = time typed in by an admin
+    outMethod: { type: String, enum: ['auto', 'admin'] },
   },
   { _id: false }
 );
@@ -33,7 +35,16 @@ const attendanceSchema = new mongoose.Schema(
     note: { type: String, trim: true, default: '' },
     inLocation: { type: pointSchema },
     outLocation: { type: pointSchema },
-    inMethod: { type: String, enum: ['button', 'qr', 'admin'], default: 'button' },
+    inMethod: { type: String, enum: ['button', 'qr', 'admin', 'auto'], default: 'button' },
+    // true = this day was recorded by the system for an "auto attendance" person (nobody checked in); marked absent / leave by the admin when they did not come
+    auto: { type: Boolean, default: false },
+    // Only used with status "leave" or "absent": the person was off for half the day and worked the other half.
+    // Payroll counts it as 0.5 leave / absence and 0.5 present.
+    halfDay: { type: Boolean, default: false },
+    // Attendance on a weekend or holiday is paid only when the admin accepts it as overtime (OT).
+    // '' = waiting for a decision, 'accepted' = paid as OT, 'rejected' = not paid.
+    otStatus: { type: String, enum: ['', 'accepted', 'rejected'], default: '' },
+    otPercent: { type: Number, min: 1, max: 100, default: 100 }, // accepted at this % of the day's pay (100 = a full day)
     // Only used when status is "leave". Unpaid leave is deducted from salary; the others are not.
     leaveType: { type: String, enum: ['annual', 'sick', 'unpaid', 'other'], default: 'annual' },
   },

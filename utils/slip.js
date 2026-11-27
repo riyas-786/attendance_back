@@ -92,10 +92,10 @@ function drawSlip(ws, ctx) {
   gap(10);
 
   // ---- employee
-  const rate = row.payType === 'monthly' ? `${fmt(row.rate)} per month${row.payMethod === 'days' ? ' (by days present)' : ' (fixed)'}` : row.payType === 'daily' ? `${fmt(row.rate)} per day` : `${fmt(row.rate)} per hour`;
+  const rate = fmt(row.rate); // just the amount (the Pay type beside it already says monthly / daily / hourly)
   const info = [
     [['Employee', row.name], ['Pay type', { monthly: 'Monthly', daily: 'Daily', hourly: 'Hourly' }[row.payType]]],
-    [['Employee ID', row.employeeId || '-'], ['Rate', `${currency} ${rate}`]],
+    [['Employee ID', row.employeeId || '-'], ['Basic salary', rate]],
     [['Department', row.department || '-'], ['Joined', ctx.joinDate ? dFull(ctx.joinDate) : '-']],
   ];
   info.forEach(([a, b], i) => {
@@ -137,6 +137,10 @@ function drawSlip(ws, ctx) {
     L: { fill: 'FFEAECFD', color: 'FF3A49C9' },
     UL: { fill: 'FFFFF0D6', color: 'FFB86A00' },
     A: { fill: 'FFFDEAEA', color: 'FFC62B2B' },
+    OT: { fill: 'FFFFF3C4', color: 'FF8A5A00' },
+    '½L': { fill: 'FFEAECFD', color: 'FF3A49C9' },
+    '½UL': { fill: 'FFFFF0D6', color: 'FFB86A00' },
+    '½A': { fill: 'FFFDEAEA', color: 'FFC62B2B' },
     Off: { fill: SOFT, color: MUTED },
     '': { fill: 'FFFFFFFF', color: MUTED },
   };
@@ -159,7 +163,7 @@ function drawSlip(ws, ctx) {
   });
   r = (started ? weekStart + 2 : r);
   ws.getRow(r).height = 16;
-  cell(r, 1, 14, '1 = present     L = paid leave     UL = unpaid leave     A = absent     Off = weekend / holiday', { size: 9, color: MUTED, align: 'center' });
+  cell(r, 1, 14, '1 = present     L = paid leave     UL = unpaid leave     A = absent     ½L / ½UL / ½A = half day     OT = holiday overtime     Off = weekend / holiday', { size: 9, color: MUTED, align: 'center' });
   r += 1;
   gap(10);
 

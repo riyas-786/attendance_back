@@ -56,7 +56,7 @@ function secondsToWait(rec, now = new Date()) {
 
 // Read-only list of {in, out} for reports (works for old and new records)
 function listSessions(rec) {
-  if (rec.sessions && rec.sessions.length) return rec.sessions.map((x) => ({ in: x.in, out: x.out }));
+  if (rec.sessions && rec.sessions.length) return rec.sessions.map((x) => ({ in: x.in, out: x.out, outMethod: x.outMethod }));
   return rec.checkIn ? [{ in: rec.checkIn, out: rec.checkOut }] : [];
 }
 

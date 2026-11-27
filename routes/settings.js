@@ -1,11 +1,11 @@
 const express = require('express');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, adminOnly, anyPermission } = require('../middleware/auth');
 const { getSettings, saveSettings } = require('../utils/settings');
 
 const router = express.Router();
-router.use(protect, adminOnly);
+router.use(protect);
 
-router.get('/', async (req, res) => {
+router.get('/', anyPermission, async (req, res) => {
   try {
     res.json(await getSettings());
   } catch (err) {
@@ -13,7 +13,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-router.put('/', async (req, res) => {
+router.put('/', adminOnly, async (req, res) => {
   try {
     const { values, error } = await saveSettings(req.body);
     if (error) return res.status(400).json({ message: error });

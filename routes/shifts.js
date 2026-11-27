@@ -2,10 +2,10 @@ const express = require('express');
 const mongoose = require('mongoose');
 const Shift = require('../models/Shift');
 const User = require('../models/User');
-const { protect, adminOnly } = require('../middleware/auth');
+const { protect, adminOnly, anyPermission } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(protect, adminOnly);
+router.use(protect);
 
 function clean(body) {
   const name = String(body.name || '').trim();
@@ -21,7 +21,7 @@ function clean(body) {
   return { value: { name, workStart, workEnd, graceMinutes } };
 }
 
-router.get('/', async (req, res) => {
+router.get('/', anyPermission, async (req, res) => {
   const [shifts, counts] = await Promise.all([
     Shift.find().sort({ workStart: 1, name: 1 }).lean(),
     User.aggregate([{ $match: { shift: { $ne: null } } }, { $group: { _id: '$shift', n: { $sum: 1 } } }]),
@@ -30,7 +30,7 @@ router.get('/', async (req, res) => {
   res.json(shifts.map((s) => ({ ...s, staffCount: byId.get(String(s._id)) || 0 })));
 });
 
-router.post('/', async (req, res) => {
+router.post('/', adminOnly, async (req, res) => {
   try {
     const { value, error } = clean(req.body);
     if (error) return res.status(400).json({ message: error });
@@ -41,7 +41,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.put('/:id', async (req, res) => {
+router.put('/:id', adminOnly, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Shift not found' });
     const { value, error } = clean(req.body);
@@ -56,7 +56,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // Deleting puts those staff back on the default duty time from Settings
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', adminOnly, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Shift not found' });
   const shift = await Shift.findByIdAndDelete(req.params.id);
   if (!shift) return res.status(404).json({ message: 'Shift not found' });
